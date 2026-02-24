@@ -1,0 +1,7 @@
+[package]
+name = "seshmux-ui-tree"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]

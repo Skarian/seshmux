@@ -1,0 +1,5 @@
+/target
+.DS_Store
+/.agent
+AGENTS.md
+PRD.md
