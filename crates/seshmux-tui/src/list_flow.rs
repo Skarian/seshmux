@@ -2,9 +2,12 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent};
-use ratatui::layout::{Constraint, Direction, Layout};
+use ratatui::layout::{Constraint, Direction, Layout, Margin};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
+use ratatui::widgets::{
+    Block, Borders, Paragraph, Row, Scrollbar, ScrollbarOrientation, ScrollbarState, Table,
+    TableState,
+};
 use seshmux_app::{App, ListResult, WorktreeRow};
 
 use crate::UiExit;
@@ -99,54 +102,82 @@ impl ListFlow {
             .constraints([Constraint::Min(10), Constraint::Length(3)])
             .areas(area);
 
-        let mut items = Vec::<ListItem<'_>>::new();
-
         if self.rows.is_empty() {
-            items.push(ListItem::new("No worktrees are registered."));
+            let empty = Paragraph::new("No worktrees are registered.").block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("List: worktrees"),
+            );
+            frame.render_widget(empty, body);
         } else {
-            items.extend(self.rows.iter().map(render_row));
-        }
-
-        let list = List::new(items)
+            let header = Row::new(["Name", "Created", "Branch", "Session", "Path"]).style(
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            );
+            let rows = self.rows.iter().map(|row| {
+                let status = if row.session_running {
+                    "running"
+                } else {
+                    "not running"
+                };
+                Row::new(vec![
+                    row.name.clone(),
+                    row.created_at.clone(),
+                    row.branch.clone(),
+                    status.to_string(),
+                    row.path.display().to_string(),
+                ])
+            });
+            let table = Table::new(
+                rows,
+                [
+                    Constraint::Length(24),
+                    Constraint::Length(28),
+                    Constraint::Length(20),
+                    Constraint::Length(14),
+                    Constraint::Min(24),
+                ],
+            )
+            .header(header)
             .block(
                 Block::default()
                     .borders(Borders::ALL)
                     .title("List: worktrees"),
             )
-            .highlight_style(
+            .row_highlight_style(
                 Style::default()
                     .fg(Color::Black)
                     .bg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
-            );
-        let mut state = ListState::default();
-        if !self.rows.is_empty() {
+            )
+            .highlight_symbol(">> ");
+
+            let mut state = TableState::new();
             state.select(Some(self.selected));
+            frame.render_stateful_widget(table, body, &mut state);
+
+            let viewport = body.height.saturating_sub(3) as usize;
+            let mut scrollbar_state = ScrollbarState::new(self.rows.len())
+                .position(self.selected)
+                .viewport_content_length(viewport);
+            frame.render_stateful_widget(
+                Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                    .begin_symbol(None)
+                    .end_symbol(None),
+                body.inner(Margin {
+                    vertical: 1,
+                    horizontal: 0,
+                }),
+                &mut scrollbar_state,
+            );
         }
-        frame.render_stateful_widget(list, body, &mut state);
 
         let keys =
             Paragraph::new("Up/Down: move    Enter/r: refresh    Esc: back    Ctrl+C: cancel")
                 .block(Block::default().borders(Borders::ALL).title("Keys"));
         frame.render_widget(keys, footer);
     }
-}
-
-fn render_row(row: &WorktreeRow) -> ListItem<'static> {
-    let status = if row.session_running {
-        "running"
-    } else {
-        "not running"
-    };
-    let text = format!(
-        "{} | {} | {} | {} | {}",
-        row.name,
-        row.created_at,
-        row.branch,
-        status,
-        row.path.display()
-    );
-    ListItem::new(text)
 }
 
 #[cfg(test)]

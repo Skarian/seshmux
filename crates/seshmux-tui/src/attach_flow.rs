@@ -1,11 +1,16 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use ratatui::layout::{Constraint, Direction, Layout};
+use crossterm::event::{Event, KeyCode, KeyEvent};
+use ratatui::layout::{Constraint, Direction, Layout, Margin};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
+use ratatui::widgets::{
+    Block, Borders, Clear, Paragraph, Row, Scrollbar, ScrollbarOrientation, ScrollbarState, Table,
+    TableState,
+};
 use seshmux_app::{App, AttachError, AttachRequest, AttachResult, ListResult, WorktreeRow};
+use tui_input::Input;
+use tui_input::backend::crossterm::EventHandler;
 
 use crate::{UiExit, centered_rect};
 
@@ -45,7 +50,7 @@ struct AttachFlow {
     rows: Vec<WorktreeRow>,
     filtered: Vec<usize>,
     selected: usize,
-    query: String,
+    query: Input,
     missing_yes_selected: bool,
     pending_worktree_name: Option<String>,
     success_message: Option<String>,
@@ -84,7 +89,7 @@ impl AttachFlow {
             rows: result.rows,
             filtered: Vec::new(),
             selected: 0,
-            query: String::new(),
+            query: Input::default(),
             missing_yes_selected: true,
             pending_worktree_name: None,
             success_message: None,
@@ -98,8 +103,8 @@ impl AttachFlow {
         match self.step {
             Step::SelectWorktree => self.on_key_select(key, ops),
             Step::MissingSessionPrompt => self.on_key_missing_prompt(key, ops),
-            Step::Success => self.on_key_success(key),
-            Step::Error => self.on_key_error(key),
+            Step::Success => Ok(self.on_key_success(key)),
+            Step::Error => Ok(self.on_key_error(key)),
         }
     }
 
@@ -114,18 +119,6 @@ impl AttachFlow {
                 if self.selected + 1 < self.filtered.len() {
                     self.selected += 1;
                 }
-                Ok(FlowSignal::Continue)
-            }
-            KeyCode::Backspace => {
-                self.query.pop();
-                self.refresh_filtered();
-                Ok(FlowSignal::Continue)
-            }
-            KeyCode::Char(character)
-                if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
-            {
-                self.query.push(character);
-                self.refresh_filtered();
                 Ok(FlowSignal::Continue)
             }
             KeyCode::Enter => {
@@ -160,7 +153,12 @@ impl AttachFlow {
 
                 Ok(FlowSignal::Continue)
             }
-            _ => Ok(FlowSignal::Continue),
+            _ => {
+                if self.query.handle_event(&Event::Key(key)).is_some() {
+                    self.refresh_filtered();
+                }
+                Ok(FlowSignal::Continue)
+            }
         }
     }
 
@@ -215,25 +213,25 @@ impl AttachFlow {
         }
     }
 
-    fn on_key_success(&mut self, key: KeyEvent) -> Result<FlowSignal> {
+    fn on_key_success(&mut self, key: KeyEvent) -> FlowSignal {
         match key.code {
-            KeyCode::Esc | KeyCode::Enter => Ok(FlowSignal::Exit(UiExit::Completed)),
-            _ => Ok(FlowSignal::Continue),
+            KeyCode::Esc | KeyCode::Enter => FlowSignal::Exit(UiExit::Completed),
+            _ => FlowSignal::Continue,
         }
     }
 
-    fn on_key_error(&mut self, key: KeyEvent) -> Result<FlowSignal> {
+    fn on_key_error(&mut self, key: KeyEvent) -> FlowSignal {
         match key.code {
             KeyCode::Esc | KeyCode::Enter => {
                 self.step = Step::SelectWorktree;
-                Ok(FlowSignal::Continue)
+                FlowSignal::Continue
             }
-            _ => Ok(FlowSignal::Continue),
+            _ => FlowSignal::Continue,
         }
     }
 
     fn refresh_filtered(&mut self) {
-        let query = self.query.trim().to_lowercase();
+        let query = self.query.value().trim().to_lowercase();
         self.filtered = self
             .rows
             .iter()
@@ -274,52 +272,111 @@ impl AttachFlow {
 
     fn render_select(&self, frame: &mut ratatui::Frame<'_>) {
         let area = frame.area();
-        let [body, footer] = Layout::default()
+        let [filter_area, table_area, footer] = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Min(10), Constraint::Length(3)])
+            .constraints([
+                Constraint::Length(3),
+                Constraint::Min(8),
+                Constraint::Length(3),
+            ])
             .areas(area);
 
-        let title = format!("Attach: select worktree (filter: {})", self.query);
-        let mut items = Vec::<ListItem<'_>>::new();
+        self.render_filter(frame, filter_area);
 
         if self.filtered.is_empty() {
-            items.push(ListItem::new("No matching worktrees."));
+            let empty = Paragraph::new("No matching worktrees.").block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("Attach: select worktree"),
+            );
+            frame.render_widget(empty, table_area);
         } else {
-            for index in &self.filtered {
-                if let Some(row) = self.rows.get(*index) {
+            let header = Row::new(["Name", "Created", "Branch", "Session"]).style(
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            );
+            let rows = self
+                .filtered
+                .iter()
+                .filter_map(|index| self.rows.get(*index))
+                .map(|row| {
                     let state = if row.session_running {
                         "running"
                     } else {
                         "missing"
                     };
-                    items.push(ListItem::new(format!(
-                        "{} | {} | {} | {}",
-                        row.name, row.created_at, row.branch, state
-                    )));
-                }
-            }
-        }
+                    Row::new(vec![
+                        row.name.clone(),
+                        row.created_at.clone(),
+                        row.branch.clone(),
+                        state.to_string(),
+                    ])
+                });
 
-        let list = List::new(items)
-            .block(Block::default().borders(Borders::ALL).title(title))
-            .highlight_style(
+            let table = Table::new(
+                rows,
+                [
+                    Constraint::Length(24),
+                    Constraint::Length(28),
+                    Constraint::Length(20),
+                    Constraint::Length(12),
+                ],
+            )
+            .header(header)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("Attach: select worktree"),
+            )
+            .row_highlight_style(
                 Style::default()
                     .fg(Color::Black)
                     .bg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
-            );
+            )
+            .highlight_symbol(">> ");
 
-        let mut state = ListState::default();
-        if !self.filtered.is_empty() {
+            let mut state = TableState::new();
             state.select(Some(self.selected));
-        }
-        frame.render_stateful_widget(list, body, &mut state);
+            frame.render_stateful_widget(table, table_area, &mut state);
 
-        let keys = Paragraph::new(
-            "Type: filter    Enter: attach    Up/Down: move    Backspace: delete char    Esc: back",
-        )
-        .block(Block::default().borders(Borders::ALL).title("Keys"));
+            let viewport = table_area.height.saturating_sub(3) as usize;
+            let mut scrollbar_state = ScrollbarState::new(self.filtered.len())
+                .position(self.selected)
+                .viewport_content_length(viewport);
+            frame.render_stateful_widget(
+                Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                    .begin_symbol(None)
+                    .end_symbol(None),
+                table_area.inner(Margin {
+                    vertical: 1,
+                    horizontal: 0,
+                }),
+                &mut scrollbar_state,
+            );
+        }
+
+        let keys = Paragraph::new("Type: filter    Enter: attach    Up/Down: move    Esc: back")
+            .block(Block::default().borders(Borders::ALL).title("Keys"));
         frame.render_widget(keys, footer);
+    }
+
+    fn render_filter(&self, frame: &mut ratatui::Frame<'_>, area: ratatui::layout::Rect) {
+        let width = area.width.saturating_sub(2) as usize;
+        let scroll = self.query.visual_scroll(width);
+        let query_text = self.query.value();
+        let paragraph = Paragraph::new(query_text)
+            .scroll((0, scroll as u16))
+            .block(Block::default().borders(Borders::ALL).title("Filter"));
+        frame.render_widget(paragraph, area);
+
+        if width == 0 {
+            return;
+        }
+        let visual = self.query.visual_cursor();
+        let relative = visual.saturating_sub(scroll).min(width.saturating_sub(1));
+        frame.set_cursor_position((area.x + 1 + relative as u16, area.y + 1));
     }
 
     fn render_missing_prompt(&self, frame: &mut ratatui::Frame<'_>) {

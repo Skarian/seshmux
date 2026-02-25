@@ -2,13 +2,18 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow};
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{Event, KeyCode, KeyEvent};
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Line;
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
+use ratatui::widgets::{
+    Block, Borders, Clear, List, ListItem, ListState, Paragraph, ScrollbarOrientation,
+};
 use seshmux_app::{App, NewPrepare, NewRequest, NewResult, NewStartPoint};
 use seshmux_core::git::{BranchRef, CommitRef};
+use tui_input::Input;
+use tui_input::backend::crossterm::EventHandler;
+use tui_tree_widget::{Scrollbar as TreeScrollbar, Tree, TreeItem, TreeState};
 
 use crate::{UiExit, centered_rect};
 
@@ -83,7 +88,6 @@ struct ExtraNode {
 #[derive(Debug, Clone)]
 struct VisibleRow {
     key: String,
-    depth: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -93,7 +97,7 @@ struct ExtrasState {
     checked: HashSet<String>,
     visible: Vec<VisibleRow>,
     cursor: usize,
-    filter: String,
+    filter: Input,
     editing_filter: bool,
 }
 
@@ -127,7 +131,7 @@ impl ExtrasState {
             checked: HashSet::new(),
             visible: Vec::new(),
             cursor: 0,
-            filter: String::new(),
+            filter: Input::default(),
             editing_filter: false,
         };
         state.refresh_visible();
@@ -138,7 +142,7 @@ impl ExtrasState {
         self.visible.clear();
         let roots = self.roots.clone();
         for root in &roots {
-            self.push_visible(root, 0);
+            self.push_visible(root);
         }
 
         if self.visible.is_empty() {
@@ -148,14 +152,13 @@ impl ExtrasState {
         }
     }
 
-    fn push_visible(&mut self, key: &str, depth: usize) {
+    fn push_visible(&mut self, key: &str) {
         if !self.subtree_matches_filter(key) {
             return;
         }
 
         self.visible.push(VisibleRow {
             key: key.to_string(),
-            depth,
         });
 
         let Some(node) = self.nodes.get(key) else {
@@ -164,12 +167,12 @@ impl ExtrasState {
         let children = node.children.clone();
 
         for child in &children {
-            self.push_visible(child, depth + 1);
+            self.push_visible(child);
         }
     }
 
     fn subtree_matches_filter(&self, key: &str) -> bool {
-        if self.filter.trim().is_empty() {
+        if self.filter.value().trim().is_empty() {
             return true;
         }
 
@@ -177,7 +180,7 @@ impl ExtrasState {
             return false;
         };
 
-        let needle = self.filter.trim().to_lowercase();
+        let needle = self.filter.value().trim().to_lowercase();
         if node.key.to_lowercase().contains(&needle) || node.label.to_lowercase().contains(&needle)
         {
             return true;
@@ -237,19 +240,9 @@ impl ExtrasState {
     }
 
     fn edit_filter(&mut self, key: KeyEvent) {
-        match key.code {
-            KeyCode::Backspace => {
-                self.filter.pop();
-            }
-            KeyCode::Char(character)
-                if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
-            {
-                self.filter.push(character);
-            }
-            _ => {}
+        if self.filter.handle_event(&Event::Key(key)).is_some() {
+            self.refresh_visible();
         }
-
-        self.refresh_visible();
     }
 
     fn selected_for_copy(&self) -> Vec<PathBuf> {
@@ -349,6 +342,78 @@ impl ExtrasState {
         }
         false
     }
+
+    fn tree_items(&self) -> Vec<TreeItem<'static, String>> {
+        let mut items = Vec::new();
+        for root in &self.roots {
+            if let Some(item) = self.tree_item_for(root) {
+                items.push(item);
+            }
+        }
+        items
+    }
+
+    fn tree_item_for(&self, key: &str) -> Option<TreeItem<'static, String>> {
+        if !self.subtree_matches_filter(key) {
+            return None;
+        }
+
+        let node = self.nodes.get(key)?;
+        let label = format!(
+            "{} {} {}",
+            self.mark_for(key),
+            if node.is_dir { "[D]" } else { "[F]" },
+            node.label
+        );
+
+        let mut children = Vec::new();
+        for child in &node.children {
+            if let Some(item) = self.tree_item_for(child) {
+                children.push(item);
+            }
+        }
+
+        if children.is_empty() {
+            Some(TreeItem::new_leaf(key.to_string(), label))
+        } else {
+            Some(
+                TreeItem::new(key.to_string(), label, children)
+                    .expect("all extra tree identifiers are unique"),
+            )
+        }
+    }
+
+    fn tree_state(&self) -> TreeState<String> {
+        let mut state = TreeState::default();
+        for row in &self.visible {
+            let is_dir = self
+                .nodes
+                .get(&row.key)
+                .map(|node| node.is_dir)
+                .unwrap_or(false);
+            if is_dir {
+                state.open(identifier_path_for_key(&row.key));
+            }
+        }
+
+        if let Some(row) = self.visible.get(self.cursor) {
+            state.select(identifier_path_for_key(&row.key));
+        }
+        state
+    }
+}
+
+fn identifier_path_for_key(key: &str) -> Vec<String> {
+    let mut identifiers = Vec::new();
+    let mut current = PathBuf::new();
+    for component in Path::new(key).components() {
+        let Component::Normal(part) = component else {
+            continue;
+        };
+        current.push(part);
+        identifiers.push(current.to_string_lossy().to_string());
+    }
+    identifiers
 }
 
 fn normalize_relative(path: &Path) -> Result<PathBuf> {
@@ -474,14 +539,14 @@ struct NewFlow {
     prepare: NewPrepare,
     step: Step,
     gitignore_yes_selected: bool,
-    name_input: String,
+    name_input: Input,
     name_error: Option<String>,
     start_mode_selected: usize,
     start_point: Option<NewStartPoint>,
     branch_picker: Option<BranchPickerState>,
-    branch_search_input: String,
+    branch_search_input: Input,
     commit_picker: Option<CommitPickerState>,
-    commit_search_input: String,
+    commit_search_input: Input,
     extras: ExtrasState,
     connect_yes_selected: bool,
     success: Option<NewResult>,
@@ -540,14 +605,14 @@ impl NewFlow {
             prepare,
             step: first_step,
             gitignore_yes_selected: true,
-            name_input: String::new(),
+            name_input: Input::default(),
             name_error: None,
             start_mode_selected: 0,
             start_point: None,
             branch_picker: None,
-            branch_search_input: String::new(),
+            branch_search_input: Input::default(),
             commit_picker: None,
-            commit_search_input: String::new(),
+            commit_search_input: Input::default(),
             extras,
             connect_yes_selected: true,
             success: None,
@@ -618,23 +683,11 @@ impl NewFlow {
                     Ok(FlowSignal::Continue)
                 }
             }
-            KeyCode::Backspace => {
-                self.name_input.pop();
-                self.name_error = None;
-                Ok(FlowSignal::Continue)
-            }
-            KeyCode::Char(character)
-                if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
-            {
-                self.name_input.push(character);
-                self.name_error = None;
-                Ok(FlowSignal::Continue)
-            }
             KeyCode::Enter => {
-                let candidate = self.name_input.trim().to_string();
+                let candidate = self.name_input.value().trim().to_string();
                 match seshmux_core::names::validate_worktree_name(&candidate) {
                     Ok(()) => {
-                        self.name_input = candidate;
+                        self.name_input = Input::new(candidate);
                         self.name_error = None;
                         self.step = Step::StartPointMode;
                     }
@@ -644,7 +697,12 @@ impl NewFlow {
                 }
                 Ok(FlowSignal::Continue)
             }
-            _ => Ok(FlowSignal::Continue),
+            _ => {
+                if self.name_input.handle_event(&Event::Key(key)).is_some() {
+                    self.name_error = None;
+                }
+                Ok(FlowSignal::Continue)
+            }
         }
     }
 
@@ -710,7 +768,7 @@ impl NewFlow {
             }
             KeyCode::Enter => {
                 if picker.selected == 0 {
-                    self.branch_search_input = picker.query.clone().unwrap_or_default();
+                    self.branch_search_input = Input::new(picker.query.clone().unwrap_or_default());
                     self.step = Step::BranchSearchInput;
                     self.branch_picker = Some(picker);
                     return Ok(FlowSignal::Continue);
@@ -745,20 +803,14 @@ impl NewFlow {
             KeyCode::Esc => {
                 self.step = Step::BranchPicker;
             }
-            KeyCode::Backspace => {
-                self.branch_search_input.pop();
-            }
-            KeyCode::Char(character)
-                if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
-            {
-                self.branch_search_input.push(character);
-            }
             KeyCode::Enter => {
-                let query = self.branch_search_input.trim().to_string();
+                let query = self.branch_search_input.value().trim().to_string();
                 self.load_branches(ops, &query)?;
                 self.step = Step::BranchPicker;
             }
-            _ => {}
+            _ => {
+                let _ = self.branch_search_input.handle_event(&Event::Key(key));
+            }
         }
         Ok(FlowSignal::Continue)
     }
@@ -788,7 +840,7 @@ impl NewFlow {
             }
             KeyCode::Enter => {
                 if picker.selected == 0 {
-                    self.commit_search_input = picker.query.clone().unwrap_or_default();
+                    self.commit_search_input = Input::new(picker.query.clone().unwrap_or_default());
                     self.step = Step::CommitSearchInput;
                     self.commit_picker = Some(picker);
                     return Ok(FlowSignal::Continue);
@@ -823,20 +875,14 @@ impl NewFlow {
             KeyCode::Esc => {
                 self.step = Step::CommitPicker;
             }
-            KeyCode::Backspace => {
-                self.commit_search_input.pop();
-            }
-            KeyCode::Char(character)
-                if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
-            {
-                self.commit_search_input.push(character);
-            }
             KeyCode::Enter => {
-                let query = self.commit_search_input.trim().to_string();
+                let query = self.commit_search_input.value().trim().to_string();
                 self.load_commits(ops, &query)?;
                 self.step = Step::CommitPicker;
             }
-            _ => {}
+            _ => {
+                let _ = self.commit_search_input.handle_event(&Event::Key(key));
+            }
         }
 
         Ok(FlowSignal::Continue)
@@ -911,7 +957,7 @@ impl NewFlow {
 
                 let request = NewRequest {
                     cwd: self.cwd.clone(),
-                    worktree_name: self.name_input.clone(),
+                    worktree_name: self.name_input.value().to_string(),
                     start_point,
                     add_worktrees_gitignore_entry: !self.prepare.gitignore_has_worktrees_entry
                         && self.gitignore_yes_selected,
@@ -1012,22 +1058,35 @@ impl NewFlow {
             .constraints([Constraint::Min(8), Constraint::Length(3)])
             .areas(area);
 
-        let mut lines = vec![
-            Line::from("Worktree name"),
-            Line::from(""),
-            Line::from(format!("> {}", self.name_input)),
-            Line::from(""),
-            Line::from("Rule: ^[a-z0-9][a-z0-9_-]{0,47}$"),
-        ];
+        let [input_area, info_area] = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(3), Constraint::Min(4)])
+            .areas(body);
 
-        if let Some(error) = &self.name_error {
-            lines.push(Line::from(""));
-            lines.push(Line::from(format!("Invalid: {error}")));
+        let width = input_area.width.saturating_sub(2) as usize;
+        let scroll = self.name_input.visual_scroll(width);
+        let input = Paragraph::new(self.name_input.value())
+            .scroll((0, scroll as u16))
+            .block(Block::default().borders(Borders::ALL).title("New: Name"));
+        frame.render_widget(input, input_area);
+
+        if width > 0 {
+            let visual = self.name_input.visual_cursor();
+            let relative = visual.saturating_sub(scroll).min(width.saturating_sub(1));
+            frame.set_cursor_position((input_area.x + 1 + relative as u16, input_area.y + 1));
         }
 
-        let paragraph =
-            Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title("New: Name"));
-        frame.render_widget(paragraph, body);
+        let mut details = vec![Line::from("Rule: ^[a-z0-9][a-z0-9_-]{0,47}$")];
+        if let Some(error) = &self.name_error {
+            details.push(Line::from(""));
+            details.push(Line::from(format!("Invalid: {error}")));
+        }
+        let info = Paragraph::new(details).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Name validation"),
+        );
+        frame.render_widget(info, info_area);
 
         let keys =
             Paragraph::new("Type to edit    Enter: continue    Backspace: delete    Esc: back")
@@ -1119,19 +1178,33 @@ impl NewFlow {
         let area = frame.area();
         let [body, footer] = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Min(6), Constraint::Length(3)])
+            .constraints([Constraint::Min(8), Constraint::Length(3)])
             .areas(area);
 
-        let paragraph = Paragraph::new(format!(
-            "Enter branch filter and press Enter.\n\n> {}",
-            self.branch_search_input
-        ))
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title("New: Branch search"),
+        let [prompt_area, input_area] = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(3), Constraint::Length(3)])
+            .areas(body);
+        frame.render_widget(
+            Paragraph::new("Enter branch filter and press Enter.").block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("New: Branch search"),
+            ),
+            prompt_area,
         );
-        frame.render_widget(paragraph, body);
+
+        let width = input_area.width.saturating_sub(2) as usize;
+        let scroll = self.branch_search_input.visual_scroll(width);
+        let input = Paragraph::new(self.branch_search_input.value())
+            .scroll((0, scroll as u16))
+            .block(Block::default().borders(Borders::ALL).title("Filter"));
+        frame.render_widget(input, input_area);
+        if width > 0 {
+            let visual = self.branch_search_input.visual_cursor();
+            let relative = visual.saturating_sub(scroll).min(width.saturating_sub(1));
+            frame.set_cursor_position((input_area.x + 1 + relative as u16, input_area.y + 1));
+        }
 
         let keys = Paragraph::new("Type: filter    Enter: apply    Backspace: delete    Esc: back")
             .block(Block::default().borders(Borders::ALL).title("Keys"));
@@ -1188,19 +1261,33 @@ impl NewFlow {
         let area = frame.area();
         let [body, footer] = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Min(6), Constraint::Length(3)])
+            .constraints([Constraint::Min(8), Constraint::Length(3)])
             .areas(area);
 
-        let paragraph = Paragraph::new(format!(
-            "Enter commit hash filter and press Enter.\n\n> {}",
-            self.commit_search_input
-        ))
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title("New: Commit search"),
+        let [prompt_area, input_area] = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(3), Constraint::Length(3)])
+            .areas(body);
+        frame.render_widget(
+            Paragraph::new("Enter commit hash filter and press Enter.").block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("New: Commit search"),
+            ),
+            prompt_area,
         );
-        frame.render_widget(paragraph, body);
+
+        let width = input_area.width.saturating_sub(2) as usize;
+        let scroll = self.commit_search_input.visual_scroll(width);
+        let input = Paragraph::new(self.commit_search_input.value())
+            .scroll((0, scroll as u16))
+            .block(Block::default().borders(Borders::ALL).title("Filter"));
+        frame.render_widget(input, input_area);
+        if width > 0 {
+            let visual = self.commit_search_input.visual_cursor();
+            let relative = visual.saturating_sub(scroll).min(width.saturating_sub(1));
+            frame.set_cursor_position((input_area.x + 1 + relative as u16, input_area.y + 1));
+        }
 
         let keys = Paragraph::new("Type: filter    Enter: apply    Backspace: delete    Esc: back")
             .block(Block::default().borders(Borders::ALL).title("Keys"));
@@ -1209,46 +1296,57 @@ impl NewFlow {
 
     fn render_extras_picker(&self, frame: &mut ratatui::Frame<'_>) {
         let area = frame.area();
-        let [body, footer] = Layout::default()
+        let [filter_area, body, footer] = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Min(12), Constraint::Length(3)])
+            .constraints([
+                Constraint::Length(3),
+                Constraint::Min(9),
+                Constraint::Length(3),
+            ])
             .areas(area);
 
-        let mut items = Vec::<ListItem<'_>>::new();
-        for row in &self.extras.visible {
-            let Some(node) = self.extras.nodes.get(&row.key) else {
-                continue;
-            };
-            let prefix = "  ".repeat(row.depth);
-            let marker = self.extras.mark_for(&row.key);
-            let icon = if node.is_dir { "[D]" } else { "[F]" };
-            let line = format!("{prefix}{marker} {icon} {}", node.label);
-            items.push(ListItem::new(line));
-        }
-
-        if items.is_empty() {
-            items.push(ListItem::new("No extra files or directories were found."));
-        }
-
-        let title = if self.extras.editing_filter {
-            format!("New: Extras (filter: {}_)", self.extras.filter)
-        } else {
-            format!("New: Extras (filter: {})", self.extras.filter)
-        };
-
-        let list = List::new(items)
-            .block(Block::default().borders(Borders::ALL).title(title))
-            .highlight_style(
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Blue)
-                    .add_modifier(Modifier::BOLD),
+        let width = filter_area.width.saturating_sub(2) as usize;
+        let scroll = self.extras.filter.visual_scroll(width);
+        let filter = Paragraph::new(self.extras.filter.value())
+            .scroll((0, scroll as u16))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("Extras filter"),
             );
-        let mut state = ListState::default();
-        if !self.extras.visible.is_empty() {
-            state.select(Some(self.extras.cursor));
+        frame.render_widget(filter, filter_area);
+        if self.extras.editing_filter && width > 0 {
+            let visual = self.extras.filter.visual_cursor();
+            let relative = visual.saturating_sub(scroll).min(width.saturating_sub(1));
+            frame.set_cursor_position((filter_area.x + 1 + relative as u16, filter_area.y + 1));
         }
-        frame.render_stateful_widget(list, body, &mut state);
+
+        let items = self.extras.tree_items();
+        if items.is_empty() {
+            frame.render_widget(
+                Paragraph::new("No extra files or directories were found.")
+                    .block(Block::default().borders(Borders::ALL).title("New: Extras")),
+                body,
+            );
+        } else {
+            let mut state = self.extras.tree_state();
+            let tree = Tree::new(&items)
+                .expect("all extra tree identifiers are unique")
+                .block(Block::default().borders(Borders::ALL).title("New: Extras"))
+                .experimental_scrollbar(Some(
+                    TreeScrollbar::new(ScrollbarOrientation::VerticalRight)
+                        .begin_symbol(None)
+                        .end_symbol(None),
+                ))
+                .highlight_style(
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Blue)
+                        .add_modifier(Modifier::BOLD),
+                )
+                .highlight_symbol(">> ");
+            frame.render_stateful_widget(tree, body, &mut state);
+        }
 
         let key_label = if self.extras.editing_filter {
             "Type: filter    Enter/Esc: finish filter edit"
@@ -1305,7 +1403,7 @@ impl NewFlow {
         let extras_count = self.extras.selected_for_copy().len();
         let review = Paragraph::new(format!(
             "Review before create:\n\nworktree: {}\nstart point: {}\nadd .gitignore entry: {}\nselected extras: {}\nconnect now: {}\n",
-            self.name_input,
+            self.name_input.value(),
             start_point,
             (!self.prepare.gitignore_has_worktrees_entry && self.gitignore_yes_selected),
             extras_count,
