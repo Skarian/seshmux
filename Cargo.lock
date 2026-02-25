@@ -1372,6 +1372,7 @@ dependencies = [
  "anyhow",
  "seshmux-core",
  "tempfile",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

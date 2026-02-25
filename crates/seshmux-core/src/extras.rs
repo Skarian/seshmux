@@ -219,6 +219,15 @@ mod tests {
                 .pop_front()
                 .unwrap_or_else(|| Err(anyhow!("missing output")))
         }
+
+        fn run_interactive(
+            &self,
+            _program: &str,
+            _args: &[&str],
+            _cwd: Option<&Path>,
+        ) -> anyhow::Result<i32> {
+            Err(anyhow!("interactive command not expected in this test"))
+        }
     }
 
     fn output(stdout: &str) -> anyhow::Result<CommandOutput> {

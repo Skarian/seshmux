@@ -34,6 +34,12 @@ pub struct CommitRef {
     pub display: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BranchDeleteMode {
+    Safe,
+    Force,
+}
+
 #[derive(Debug, Error)]
 pub enum GitError {
     #[error("git command failed: git {command} (exit {status}) {stderr}")]
@@ -50,6 +56,8 @@ pub enum GitError {
         "repository has no commits yet; create an initial commit or choose a different start point"
     )]
     NoCommits,
+    #[error("branch '{branch}' is not fully merged; explicit force is required")]
+    BranchNotFullyMerged { branch: String },
 }
 
 pub fn repo_root(cwd: &Path, runner: &dyn CommandRunner) -> Result<PathBuf, GitError> {
@@ -137,6 +145,75 @@ pub fn create_worktree(
     run_git_checked(runner, &args, Some(repo_root))?;
 
     Ok(())
+}
+
+pub fn current_branch(
+    worktree_path: &Path,
+    runner: &dyn CommandRunner,
+) -> Result<String, GitError> {
+    let output = run_git_checked(
+        runner,
+        &["rev-parse", "--abbrev-ref", "HEAD"],
+        Some(worktree_path),
+    )?;
+
+    let branch = output
+        .stdout
+        .lines()
+        .next()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| GitError::Parse("git rev-parse returned empty branch name".to_string()))?;
+
+    Ok(branch.to_string())
+}
+
+pub fn remove_worktree(
+    repo_root: &Path,
+    target_path: &Path,
+    runner: &dyn CommandRunner,
+) -> Result<(), GitError> {
+    let target = target_path
+        .to_str()
+        .ok_or_else(|| GitError::Parse("worktree path is not valid UTF-8".to_string()))?;
+
+    run_git_checked(runner, &["worktree", "remove", target], Some(repo_root))?;
+    Ok(())
+}
+
+pub fn delete_branch(
+    repo_root: &Path,
+    branch_name: &str,
+    mode: BranchDeleteMode,
+    runner: &dyn CommandRunner,
+) -> Result<(), GitError> {
+    let branch = branch_name.trim();
+    if branch.is_empty() {
+        return Err(GitError::Parse("branch name cannot be empty".to_string()));
+    }
+
+    let flag = match mode {
+        BranchDeleteMode::Safe => "-d",
+        BranchDeleteMode::Force => "-D",
+    };
+
+    let output = run_git(runner, &["branch", flag, branch], Some(repo_root))?;
+    if output.status_code == 0 {
+        return Ok(());
+    }
+
+    if matches!(mode, BranchDeleteMode::Safe) && looks_like_branch_not_fully_merged(&output.stderr)
+    {
+        return Err(GitError::BranchNotFullyMerged {
+            branch: branch.to_string(),
+        });
+    }
+
+    Err(GitError::CommandFailed {
+        command: format!("branch {flag} {branch}"),
+        status: output.status_code,
+        stderr: output.stderr.trim().to_string(),
+    })
 }
 
 pub fn query_branches(
@@ -289,6 +366,11 @@ fn looks_like_empty_history(stderr: &str) -> bool {
         || normalized.contains("unknown revision or path not in the working tree")
 }
 
+fn looks_like_branch_not_fully_merged(stderr: &str) -> bool {
+    let normalized = stderr.to_lowercase();
+    normalized.contains("not fully merged")
+}
+
 fn run_git_checked(
     runner: &dyn CommandRunner,
     args: &[&str],
@@ -354,6 +436,15 @@ mod tests {
                 .expect("lock")
                 .pop_front()
                 .unwrap_or_else(|| Err(anyhow!("missing output")))
+        }
+
+        fn run_interactive(
+            &self,
+            _program: &str,
+            _args: &[&str],
+            _cwd: Option<&Path>,
+        ) -> anyhow::Result<i32> {
+            Err(anyhow!("interactive command not expected in this test"))
         }
     }
 
@@ -430,5 +521,38 @@ mod tests {
 
         let error = resolve_current_start_point(Path::new("."), &runner).expect_err("should fail");
         assert!(matches!(error, GitError::NoCommits));
+    }
+
+    #[test]
+    fn current_branch_reads_head_name() {
+        let runner = QueueRunner::new(vec![output("feature-1\n", "", 0)]);
+        let branch = current_branch(Path::new("."), &runner).expect("branch");
+        assert_eq!(branch, "feature-1");
+    }
+
+    #[test]
+    fn delete_branch_safe_reports_not_fully_merged() {
+        let runner = QueueRunner::new(vec![output(
+            "",
+            "error: the branch 'feature-1' is not fully merged.",
+            1,
+        )]);
+
+        let error = delete_branch(Path::new("."), "feature-1", BranchDeleteMode::Safe, &runner)
+            .expect_err("branch should require force");
+
+        assert!(matches!(error, GitError::BranchNotFullyMerged { .. }));
+    }
+
+    #[test]
+    fn delete_branch_force_succeeds() {
+        let runner = QueueRunner::new(vec![output("", "", 0)]);
+        let result = delete_branch(
+            Path::new("."),
+            "feature-1",
+            BranchDeleteMode::Force,
+            &runner,
+        );
+        assert!(result.is_ok());
     }
 }

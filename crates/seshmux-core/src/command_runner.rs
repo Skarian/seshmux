@@ -15,6 +15,13 @@ pub trait CommandRunner {
         args: &[&str],
         cwd: Option<&Path>,
     ) -> anyhow::Result<CommandOutput>;
+
+    fn run_interactive(
+        &self,
+        program: &str,
+        args: &[&str],
+        cwd: Option<&Path>,
+    ) -> anyhow::Result<i32>;
 }
 
 #[derive(Debug, Default)]
@@ -47,5 +54,22 @@ impl CommandRunner for SystemCommandRunner {
             stdout: String::from_utf8_lossy(&output.stdout).to_string(),
             stderr: String::from_utf8_lossy(&output.stderr).to_string(),
         })
+    }
+
+    fn run_interactive(
+        &self,
+        program: &str,
+        args: &[&str],
+        cwd: Option<&Path>,
+    ) -> anyhow::Result<i32> {
+        let mut command = Command::new(program);
+        command.args(args);
+
+        if let Some(working_directory) = cwd {
+            command.current_dir(working_directory);
+        }
+
+        let status = command.status()?;
+        Ok(status.code().unwrap_or(-1))
     }
 }

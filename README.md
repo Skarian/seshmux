@@ -6,6 +6,7 @@ Runtime expectations:
 
 - Run `seshmux` from inside a git repository.
 - The repository must have at least one commit before runtime flows start.
+- Runtime TUI requires a valid config file.
 
 ## Configuration
 
@@ -47,5 +48,27 @@ Launch-mode rules:
 
 - `seshmux`
 - `seshmux doctor`
+- `seshmux --diagnostics`
+- `seshmux --diagnostics doctor`
 - `seshmux --help`
 - `seshmux doctor --help`
+
+## Diagnostics
+
+- `--diagnostics` writes a runtime log to `~/.config/seshmux/diagnostics/<timestamp>.log`.
+- If an internal panic occurs, seshmux prints a fatal message and references the diagnostics log path when available.
+- Without `--diagnostics`, seshmux still prints a fatal message and tells you to rerun with diagnostics.
+
+## Runtime Flows
+
+The root TUI menu includes:
+
+- `New worktree`
+- `List worktrees`
+- `Attach session`
+- `Delete worktree`
+
+## Key Semantics
+
+- `Esc`: back one step. On first step of a flow, exits that flow.
+- `Ctrl+C`: cancel the active command flow.

@@ -88,12 +88,29 @@ pub fn connect_session(
     inside_tmux: bool,
     runner: &dyn CommandRunner,
 ) -> Result<(), TmuxError> {
-    if inside_tmux {
-        run_tmux_checked(runner, &["switch-client", "-t", session], None)?;
+    let args = if inside_tmux {
+        vec!["switch-client", "-t", session]
     } else {
-        run_tmux_checked(runner, &["attach-session", "-t", session], None)?;
+        vec!["attach-session", "-t", session]
+    };
+
+    let status = runner
+        .run_interactive("tmux", &args, None)
+        .map_err(|error| TmuxError::Execute(error.to_string()))?;
+
+    if status != 0 {
+        return Err(TmuxError::CommandFailed {
+            command: args.join(" "),
+            status,
+            stderr: String::new(),
+        });
     }
 
+    Ok(())
+}
+
+pub fn kill_session(session: &str, runner: &dyn CommandRunner) -> Result<(), TmuxError> {
+    run_tmux_checked(runner, &["kill-session", "-t", session], None)?;
     Ok(())
 }
 
@@ -204,18 +221,24 @@ mod tests {
         program: String,
         args: Vec<String>,
         cwd: Option<PathBuf>,
+        interactive: bool,
     }
 
     #[derive(Default)]
     struct RecordingRunner {
         outputs: Mutex<VecDeque<anyhow::Result<CommandOutput>>>,
+        interactive_statuses: Mutex<VecDeque<anyhow::Result<i32>>>,
         calls: Mutex<Vec<Call>>,
     }
 
     impl RecordingRunner {
-        fn new(outputs: Vec<anyhow::Result<CommandOutput>>) -> Self {
+        fn new(
+            outputs: Vec<anyhow::Result<CommandOutput>>,
+            interactive_statuses: Vec<anyhow::Result<i32>>,
+        ) -> Self {
             Self {
                 outputs: Mutex::new(outputs.into()),
+                interactive_statuses: Mutex::new(interactive_statuses.into()),
                 calls: Mutex::new(Vec::new()),
             }
         }
@@ -236,6 +259,7 @@ mod tests {
                 program: program.to_string(),
                 args: args.iter().map(|value| (*value).to_string()).collect(),
                 cwd: cwd.map(|value| value.to_path_buf()),
+                interactive: false,
             });
 
             self.outputs
@@ -243,6 +267,26 @@ mod tests {
                 .expect("lock outputs")
                 .pop_front()
                 .unwrap_or_else(|| Err(anyhow!("missing output")))
+        }
+
+        fn run_interactive(
+            &self,
+            program: &str,
+            args: &[&str],
+            cwd: Option<&Path>,
+        ) -> anyhow::Result<i32> {
+            self.calls.lock().expect("lock calls").push(Call {
+                program: program.to_string(),
+                args: args.iter().map(|value| (*value).to_string()).collect(),
+                cwd: cwd.map(|value| value.to_path_buf()),
+                interactive: true,
+            });
+
+            self.interactive_statuses
+                .lock()
+                .expect("lock statuses")
+                .pop_front()
+                .unwrap_or_else(|| Err(anyhow!("missing interactive status")))
         }
     }
 
@@ -281,7 +325,7 @@ mod tests {
 
     #[test]
     fn create_session_and_windows_builds_direct_and_shell_commands() {
-        let runner = RecordingRunner::new(vec![output(0), output(0)]);
+        let runner = RecordingRunner::new(vec![output(0), output(0)], Vec::new());
         let cwd = PathBuf::from("/tmp/project/worktrees/w1");
 
         create_session_and_windows(
@@ -305,6 +349,7 @@ mod tests {
         assert_eq!(calls[0].cwd, None);
         assert!(calls[0].args.contains(&"nvim".to_string()));
         assert!(calls[0].args.contains(&".".to_string()));
+        assert!(!calls[0].interactive);
 
         assert!(calls[1].args.starts_with(&[
             "new-window".to_string(),
@@ -314,5 +359,41 @@ mod tests {
         assert!(calls[1].args.contains(&"/bin/zsh".to_string()));
         assert!(calls[1].args.contains(&"-lc".to_string()));
         assert!(calls[1].args.contains(&"echo ready".to_string()));
+        assert!(!calls[1].interactive);
+    }
+
+    #[test]
+    fn connect_session_uses_interactive_runner() {
+        let runner = RecordingRunner::new(Vec::new(), vec![Ok(0)]);
+        connect_session("repo/w1", false, &runner).expect("connect");
+
+        let calls = runner.calls();
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].interactive);
+        assert_eq!(
+            calls[0].args,
+            vec![
+                "attach-session".to_string(),
+                "-t".to_string(),
+                "repo/w1".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn kill_session_invokes_tmux_kill_session() {
+        let runner = RecordingRunner::new(vec![output(0)], Vec::new());
+        kill_session("repo/w1", &runner).expect("kill");
+
+        let calls = runner.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].args,
+            vec![
+                "kill-session".to_string(),
+                "-t".to_string(),
+                "repo/w1".to_string()
+            ]
+        );
     }
 }

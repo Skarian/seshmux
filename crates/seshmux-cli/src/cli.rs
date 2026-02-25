@@ -6,6 +6,13 @@ use clap::{Parser, Subcommand};
 #[command(version)]
 #[command(about = "Interactive git worktree + tmux workflow manager")]
 pub struct Cli {
+    #[arg(
+        long,
+        global = true,
+        help = "Write diagnostics to ~/.config/seshmux/diagnostics/<timestamp>.log"
+    )]
+    pub diagnostics: bool,
+
     #[command(subcommand)]
     pub command: Option<Command>,
 }

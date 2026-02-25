@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow};
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Line;
@@ -10,7 +10,7 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragra
 use seshmux_app::{App, NewPrepare, NewRequest, NewResult, NewStartPoint};
 use seshmux_core::git::{BranchRef, CommitRef};
 
-use crate::{TerminalSession, UiExit, centered_rect, is_ctrl_c};
+use crate::{UiExit, centered_rect};
 
 pub(crate) trait NewFlowOps {
     fn prepare(&self, cwd: &Path) -> Result<NewPrepare>;
@@ -488,10 +488,33 @@ struct NewFlow {
     error_message: Option<String>,
 }
 
+pub(crate) struct NewScreen {
+    flow: NewFlow,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FlowSignal {
     Continue,
     Exit(UiExit),
+}
+
+impl NewScreen {
+    pub(crate) fn new(app: &App<'_>, cwd: &Path) -> Result<Self> {
+        Ok(Self {
+            flow: NewFlow::new(app, cwd)?,
+        })
+    }
+
+    pub(crate) fn render(&self, frame: &mut ratatui::Frame<'_>) {
+        self.flow.render(frame);
+    }
+
+    pub(crate) fn on_key(&mut self, key: KeyEvent, app: &App<'_>) -> Result<Option<UiExit>> {
+        match self.flow.on_key(key, app)? {
+            FlowSignal::Continue => Ok(None),
+            FlowSignal::Exit(exit) => Ok(Some(exit)),
+        }
+    }
 }
 
 impl NewFlow {
@@ -1335,29 +1358,6 @@ impl NewFlow {
     }
 }
 
-pub fn run_new_flow(app: &App<'_>, cwd: &Path) -> Result<UiExit> {
-    let mut flow = NewFlow::new(app, cwd)?;
-    let mut session = TerminalSession::enter()?;
-
-    loop {
-        session.draw(|frame| flow.render(frame))?;
-
-        let event = event::read().context("failed to read terminal event")?;
-        let Event::Key(key) = event else {
-            continue;
-        };
-
-        if is_ctrl_c(key) {
-            return Ok(UiExit::Canceled);
-        }
-
-        match flow.on_key(key, app)? {
-            FlowSignal::Continue => {}
-            FlowSignal::Exit(exit) => return Ok(exit),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
@@ -1572,6 +1572,81 @@ mod tests {
 
         let after = flow.extras.selected_for_copy();
         assert_eq!(before, after);
+    }
+
+    #[test]
+    fn branch_picker_no_results_does_not_advance_to_extras() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let repo_root = temp.path().join("repo");
+        std::fs::create_dir_all(&repo_root).expect("repo");
+
+        let mut ops = FakeOps::new(repo_root.clone());
+        ops.branches.clear();
+
+        let mut flow = NewFlow::new(&ops, &repo_root).expect("flow");
+        flow.on_key(key(KeyCode::Enter), &ops).expect("gitignore");
+        for character in "featurex".chars() {
+            flow.on_key(key(KeyCode::Char(character)), &ops)
+                .expect("name");
+        }
+        flow.on_key(key(KeyCode::Enter), &ops).expect("name enter");
+        flow.on_key(key(KeyCode::Down), &ops)
+            .expect("select branch mode");
+        flow.on_key(key(KeyCode::Enter), &ops)
+            .expect("open branch picker");
+        assert_eq!(flow.step, Step::BranchPicker);
+
+        flow.on_key(key(KeyCode::Enter), &ops)
+            .expect("open branch search input");
+        assert_eq!(flow.step, Step::BranchSearchInput);
+        flow.on_key(key(KeyCode::Char('x')), &ops)
+            .expect("search char");
+        flow.on_key(key(KeyCode::Enter), &ops)
+            .expect("apply empty search");
+        assert_eq!(flow.step, Step::BranchPicker);
+
+        flow.on_key(key(KeyCode::Down), &ops)
+            .expect("select show-all action");
+        flow.on_key(key(KeyCode::Enter), &ops)
+            .expect("show-all action");
+        assert_eq!(flow.step, Step::BranchPicker);
+        assert!(flow.start_point.is_none());
+    }
+
+    #[test]
+    fn extras_enter_noops_when_filtered_view_is_empty() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let repo_root = temp.path().join("repo");
+        std::fs::create_dir_all(repo_root.join("dir/sub")).expect("dirs");
+        std::fs::write(repo_root.join("dir/sub/one.txt"), "one").expect("file one");
+
+        let mut ops = FakeOps::new(repo_root.clone());
+        ops.extras = vec![PathBuf::from("dir")];
+
+        let mut flow = NewFlow::new(&ops, &repo_root).expect("flow");
+        flow.on_key(key(KeyCode::Enter), &ops).expect("gitignore");
+        for character in "abc".chars() {
+            flow.on_key(key(KeyCode::Char(character)), &ops)
+                .expect("name");
+        }
+        flow.on_key(key(KeyCode::Enter), &ops).expect("name enter");
+        flow.on_key(key(KeyCode::Enter), &ops)
+            .expect("current mode");
+        assert_eq!(flow.step, Step::ExtrasPicker);
+
+        flow.on_key(key(KeyCode::Char('/')), &ops)
+            .expect("enter filter edit");
+        for character in "zzz".chars() {
+            flow.on_key(key(KeyCode::Char(character)), &ops)
+                .expect("type unmatched filter");
+        }
+        flow.on_key(key(KeyCode::Enter), &ops)
+            .expect("finish filter");
+        assert!(flow.extras.visible.is_empty());
+
+        flow.on_key(key(KeyCode::Enter), &ops)
+            .expect("enter on empty extras view");
+        assert_eq!(flow.step, Step::ExtrasPicker);
     }
 
     #[test]

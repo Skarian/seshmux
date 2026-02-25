@@ -1,20 +1,27 @@
+mod attach_flow;
+mod delete_flow;
+mod list_flow;
 mod new_flow;
 
 use std::io::{Stdout, stdout};
 use std::path::Path;
 
 use anyhow::{Context, Result};
+use attach_flow::AttachScreen;
 use crossterm::cursor::{Hide, Show};
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
+use delete_flow::DeleteScreen;
+use list_flow::ListScreen;
+use new_flow::NewScreen;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
+use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 use seshmux_app::App;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,7 +34,6 @@ pub enum UiExit {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RootMenuExit {
     Action(RootAction),
-    Exit(UiExit),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,9 +48,9 @@ impl RootAction {
     fn title(self) -> &'static str {
         match self {
             Self::New => "New worktree",
-            Self::List => "List worktrees (coming in next milestone)",
-            Self::Attach => "Attach session (coming in next milestone)",
-            Self::Delete => "Delete worktree (coming in next milestone)",
+            Self::List => "List worktrees",
+            Self::Attach => "Attach session",
+            Self::Delete => "Delete worktree",
         }
     }
 }
@@ -92,6 +98,103 @@ pub(crate) fn is_ctrl_c(key: KeyEvent) -> bool {
     key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c')
 }
 
+fn read_key_event() -> Result<KeyEvent> {
+    loop {
+        let event = event::read().context("failed to read terminal event")?;
+        let Event::Key(key) = event else {
+            continue;
+        };
+
+        if !matches!(key.kind, KeyEventKind::Press) {
+            continue;
+        }
+
+        return Ok(key);
+    }
+}
+
+#[derive(Debug)]
+struct RootScreen {
+    selected: usize,
+}
+
+impl RootScreen {
+    fn new() -> Self {
+        Self { selected: 0 }
+    }
+
+    fn on_key(&mut self, key: KeyEvent) -> Option<RootMenuExit> {
+        match key.code {
+            KeyCode::Esc => None,
+            KeyCode::Up => {
+                self.selected = self.selected.saturating_sub(1);
+                None
+            }
+            KeyCode::Down => {
+                if self.selected + 1 < ROOT_ACTIONS.len() {
+                    self.selected += 1;
+                }
+                None
+            }
+            KeyCode::Enter => Some(RootMenuExit::Action(ROOT_ACTIONS[self.selected])),
+            _ => None,
+        }
+    }
+
+    fn render(&self, frame: &mut ratatui::Frame<'_>, cwd: &Path) {
+        let area = frame.area();
+        let [header, body, footer] = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(4),
+                Constraint::Min(8),
+                Constraint::Length(4),
+            ])
+            .areas(area);
+
+        let title = Paragraph::new(format!(
+            "seshmux\n{}\nSelect a workflow",
+            cwd.to_string_lossy()
+        ))
+        .block(Block::default().borders(Borders::ALL).title("Root"));
+        frame.render_widget(title, header);
+
+        let items: Vec<ListItem<'_>> = ROOT_ACTIONS
+            .iter()
+            .map(|action| ListItem::new(action.title()))
+            .collect();
+        let list = List::new(items)
+            .block(Block::default().borders(Borders::ALL).title("Actions"))
+            .highlight_style(
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            );
+
+        let mut state = ListState::default();
+        state.select(Some(self.selected));
+        frame.render_stateful_widget(list, body, &mut state);
+
+        let hints = Paragraph::new("Enter: select    Up/Down: move    Ctrl+C: cancel")
+            .block(Block::default().borders(Borders::ALL).title("Keys"));
+        frame.render_widget(hints, footer);
+    }
+}
+
+enum ActiveScreen {
+    Root(RootScreen),
+    New(Box<NewScreen>),
+    List(Box<ListScreen>),
+    Attach(Box<AttachScreen>),
+    Delete(Box<DeleteScreen>),
+}
+
+enum Transition {
+    Open(RootAction),
+    Return(UiExit),
+}
+
 pub fn run_root(app: &App<'_>, cwd: &Path) -> Result<UiExit> {
     if let Ok(exit) = std::env::var("SESHMUX_TUI_TEST_EXIT") {
         return Ok(match exit.as_str() {
@@ -102,119 +205,58 @@ pub fn run_root(app: &App<'_>, cwd: &Path) -> Result<UiExit> {
         });
     }
 
-    loop {
-        match run_root_menu(cwd)? {
-            RootMenuExit::Action(RootAction::New) => match new_flow::run_new_flow(app, cwd)? {
-                UiExit::BackAtRoot | UiExit::Completed => continue,
-                UiExit::Canceled => return Ok(UiExit::Canceled),
-            },
-            RootMenuExit::Action(RootAction::List)
-            | RootMenuExit::Action(RootAction::Attach)
-            | RootMenuExit::Action(RootAction::Delete) => continue,
-            RootMenuExit::Exit(exit) => return Ok(exit),
-        }
-    }
-}
-
-fn run_root_menu(cwd: &Path) -> Result<RootMenuExit> {
     let mut session = TerminalSession::enter()?;
-    let mut selected = 0usize;
-    let mut notice: Option<String> = None;
+    let mut active = ActiveScreen::Root(RootScreen::new());
 
     loop {
-        session.draw(|frame| draw_root_menu(frame, cwd, selected, notice.as_deref()))?;
+        session.draw(|frame| match &active {
+            ActiveScreen::Root(screen) => screen.render(frame, cwd),
+            ActiveScreen::New(screen) => screen.render(frame),
+            ActiveScreen::List(screen) => screen.render(frame),
+            ActiveScreen::Attach(screen) => screen.render(frame),
+            ActiveScreen::Delete(screen) => screen.render(frame),
+        })?;
 
-        let event = event::read().context("failed to read terminal event")?;
-        let Event::Key(key) = event else {
-            continue;
-        };
+        let key = read_key_event()?;
 
         if is_ctrl_c(key) {
-            return Ok(RootMenuExit::Exit(UiExit::Canceled));
+            return Ok(UiExit::Canceled);
         }
 
-        if notice.is_some() {
-            match key.code {
-                KeyCode::Esc | KeyCode::Enter => {
-                    notice = None;
+        let transition = match &mut active {
+            ActiveScreen::Root(screen) => screen
+                .on_key(key)
+                .map(|RootMenuExit::Action(action)| Transition::Open(action)),
+            ActiveScreen::New(screen) => screen.on_key(key, app)?.map(Transition::Return),
+            ActiveScreen::List(screen) => screen.on_key(key, app)?.map(Transition::Return),
+            ActiveScreen::Attach(screen) => screen.on_key(key, app)?.map(Transition::Return),
+            ActiveScreen::Delete(screen) => screen.on_key(key, app)?.map(Transition::Return),
+        };
+
+        if let Some(transition) = transition {
+            match transition {
+                Transition::Open(action) => {
+                    active = match action {
+                        RootAction::New => ActiveScreen::New(Box::new(NewScreen::new(app, cwd)?)),
+                        RootAction::List => {
+                            ActiveScreen::List(Box::new(ListScreen::new(app, cwd)?))
+                        }
+                        RootAction::Attach => {
+                            ActiveScreen::Attach(Box::new(AttachScreen::new(app, cwd)?))
+                        }
+                        RootAction::Delete => {
+                            ActiveScreen::Delete(Box::new(DeleteScreen::new(app, cwd)?))
+                        }
+                    };
                 }
-                _ => {}
+                Transition::Return(exit) => match exit {
+                    UiExit::BackAtRoot | UiExit::Completed => {
+                        active = ActiveScreen::Root(RootScreen::new());
+                    }
+                    UiExit::Canceled => return Ok(UiExit::Canceled),
+                },
             }
-            continue;
         }
-
-        match key.code {
-            KeyCode::Esc => return Ok(RootMenuExit::Exit(UiExit::BackAtRoot)),
-            KeyCode::Up => {
-                selected = selected.saturating_sub(1);
-            }
-            KeyCode::Down => {
-                if selected + 1 < ROOT_ACTIONS.len() {
-                    selected += 1;
-                }
-            }
-            KeyCode::Enter => {
-                let action = ROOT_ACTIONS[selected];
-                if matches!(action, RootAction::New) {
-                    return Ok(RootMenuExit::Action(action));
-                }
-                notice = Some("This flow ships in the next milestone.".to_string());
-            }
-            _ => {}
-        }
-    }
-}
-
-fn draw_root_menu(
-    frame: &mut ratatui::Frame<'_>,
-    cwd: &Path,
-    selected: usize,
-    notice: Option<&str>,
-) {
-    let area = frame.area();
-    let [header, body, footer] = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(4),
-            Constraint::Min(8),
-            Constraint::Length(4),
-        ])
-        .areas(area);
-
-    let title = Paragraph::new(format!(
-        "seshmux\n{}\nSelect a workflow",
-        cwd.to_string_lossy()
-    ))
-    .block(Block::default().borders(Borders::ALL).title("Root"));
-    frame.render_widget(title, header);
-
-    let items: Vec<ListItem<'_>> = ROOT_ACTIONS
-        .iter()
-        .map(|action| ListItem::new(action.title()))
-        .collect();
-    let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title("Actions"))
-        .highlight_style(
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        );
-
-    let mut state = ListState::default();
-    state.select(Some(selected));
-    frame.render_stateful_widget(list, body, &mut state);
-
-    let hints = Paragraph::new("Enter: select    Esc: exit    Ctrl+C: cancel")
-        .block(Block::default().borders(Borders::ALL).title("Keys"));
-    frame.render_widget(hints, footer);
-
-    if let Some(message) = notice {
-        let popup = centered_rect(70, 20, area);
-        frame.render_widget(Clear, popup);
-        let paragraph = Paragraph::new(format!("{message}\n\nEnter/Esc to return"))
-            .block(Block::default().borders(Borders::ALL).title("Notice"));
-        frame.render_widget(paragraph, popup);
     }
 }
 
@@ -223,21 +265,50 @@ pub(crate) fn centered_rect(
     percent_y: u16,
     area: ratatui::layout::Rect,
 ) -> ratatui::layout::Rect {
-    let [vertical] = Layout::default()
+    let pct_x = percent_x.min(100);
+    let pct_y = percent_y.min(100);
+
+    let [_, vertical, _] = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Percentage((100 - percent_y) / 2),
-            Constraint::Percentage(percent_y),
-            Constraint::Percentage((100 - percent_y) / 2),
+            Constraint::Percentage((100 - pct_y) / 2),
+            Constraint::Percentage(pct_y),
+            Constraint::Percentage((100 - pct_y) / 2),
         ])
         .areas(area);
-    let [horizontal] = Layout::default()
+    let [_, horizontal, _] = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Percentage((100 - percent_x) / 2),
-            Constraint::Percentage(percent_x),
-            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Percentage((100 - pct_x) / 2),
+            Constraint::Percentage(pct_x),
+            Constraint::Percentage((100 - pct_x) / 2),
         ])
         .areas(vertical);
     horizontal
+}
+
+#[cfg(test)]
+mod tests {
+    use ratatui::layout::Rect;
+
+    use super::centered_rect;
+
+    #[test]
+    fn centered_rect_returns_middle_segment() {
+        let area = Rect::new(0, 0, 100, 50);
+        let centered = centered_rect(80, 60, area);
+
+        assert_eq!(centered.width, 80);
+        assert_eq!(centered.height, 30);
+        assert_eq!(centered.x, 10);
+        assert_eq!(centered.y, 10);
+    }
+
+    #[test]
+    fn centered_rect_clamps_percentages_over_100() {
+        let area = Rect::new(3, 4, 40, 20);
+        let centered = centered_rect(120, 150, area);
+
+        assert_eq!(centered, area);
+    }
 }

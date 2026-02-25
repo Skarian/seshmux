@@ -52,6 +52,15 @@ impl CommandRunner for QueueRunner {
             .pop_front()
             .unwrap_or_else(|| Err(anyhow!("missing scripted output")))
     }
+
+    fn run_interactive(
+        &self,
+        _program: &str,
+        _args: &[&str],
+        _cwd: Option<&Path>,
+    ) -> anyhow::Result<i32> {
+        Err(anyhow!("interactive command not expected in this test"))
+    }
 }
 
 fn output(stdout: &str, stderr: &str, status: i32) -> anyhow::Result<CommandOutput> {

@@ -94,6 +94,30 @@ pub fn ensure_entry_available(
     Ok(())
 }
 
+pub fn find_entry_by_name(
+    repo_root: &Path,
+    name: &str,
+) -> Result<Option<RegistryEntry>, RegistryError> {
+    let entries = load_registry(repo_root)?;
+    Ok(entries.into_iter().find(|entry| entry.name == name))
+}
+
+pub fn remove_entry_by_name(
+    repo_root: &Path,
+    name: &str,
+) -> Result<Option<RegistryEntry>, RegistryError> {
+    let mut entries = load_registry(repo_root)?;
+    let index = entries.iter().position(|entry| entry.name == name);
+
+    let Some(index) = index else {
+        return Ok(None);
+    };
+
+    let removed = entries.remove(index);
+    write_registry(repo_root, entries)?;
+    Ok(Some(removed))
+}
+
 pub fn insert_unique_entry(repo_root: &Path, entry: RegistryEntry) -> Result<(), RegistryError> {
     let mut entries = load_registry(repo_root)?;
 
@@ -180,5 +204,43 @@ mod tests {
         .expect_err("duplicate should fail");
 
         assert!(matches!(error, RegistryError::DuplicateName { .. }));
+    }
+
+    #[test]
+    fn remove_entry_by_name_updates_registry_file() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let repo_root = temp.path();
+        fs::create_dir_all(repo_root.join("worktrees")).expect("worktrees dir");
+
+        let w1 = RegistryEntry {
+            name: "w1".to_string(),
+            path: repo_root
+                .join("worktrees")
+                .join("w1")
+                .to_string_lossy()
+                .to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+        };
+        let w2 = RegistryEntry {
+            name: "w2".to_string(),
+            path: repo_root
+                .join("worktrees")
+                .join("w2")
+                .to_string_lossy()
+                .to_string(),
+            created_at: "2026-01-01T00:00:01Z".to_string(),
+        };
+
+        insert_unique_entry(repo_root, w1.clone()).expect("insert w1");
+        insert_unique_entry(repo_root, w2.clone()).expect("insert w2");
+
+        let removed = remove_entry_by_name(repo_root, "w1")
+            .expect("remove")
+            .expect("existing");
+        assert_eq!(removed, w1);
+
+        let remaining = load_registry(repo_root).expect("reload");
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0], w2);
     }
 }

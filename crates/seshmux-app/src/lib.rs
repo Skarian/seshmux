@@ -1,5 +1,11 @@
+mod attach;
+mod delete;
+mod list;
 mod new;
 
+pub use attach::{AttachError, AttachRequest, AttachResult};
+pub use delete::{DeleteError, DeleteRequest, DeleteResult};
+pub use list::{ListResult, WorktreeRow};
 pub use new::{NewPrepare, NewRequest, NewResult, NewStartPoint};
 
 use std::path::{Path, PathBuf};

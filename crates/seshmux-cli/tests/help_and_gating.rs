@@ -79,6 +79,28 @@ fn init_git_repo_with_commit(path: &Path) {
     );
 }
 
+fn assert_timestamp_log_names(entries: &[std::fs::DirEntry]) {
+    assert!(!entries.is_empty(), "expected at least one diagnostics log");
+
+    for entry in entries {
+        let name = entry
+            .file_name()
+            .into_string()
+            .expect("diagnostics filename utf8");
+        assert!(
+            name.ends_with(".log"),
+            "diagnostics file should end with .log: {name}"
+        );
+        let stem = name
+            .strip_suffix(".log")
+            .expect("diagnostics filename .log suffix");
+        assert!(
+            !stem.is_empty() && stem.chars().all(|character| character.is_ascii_digit()),
+            "diagnostics filename must be <timestamp>.log, got: {name}"
+        );
+    }
+}
+
 #[test]
 fn root_help_runs_without_config() {
     let (mut command, _temp_home) = new_command_with_temp_home();
@@ -87,6 +109,7 @@ fn root_help_runs_without_config() {
         .assert()
         .success()
         .stdout(predicate::str::contains("Usage: seshmux"))
+        .stdout(predicate::str::contains("--diagnostics"))
         .stdout(predicate::str::contains("doctor"))
         .stdout(predicate::str::contains("new").not())
         .stdout(predicate::str::contains("list").not())
@@ -196,4 +219,44 @@ fn root_command_fails_in_repo_with_no_commits_before_tui() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("repository has no commits yet"));
+}
+
+#[test]
+fn root_command_with_diagnostics_creates_log_file() {
+    let (mut command, temp_home) = new_command_with_temp_home();
+    write_valid_config(temp_home.path());
+    let repo_dir = temp_home.path().join("repo");
+    init_git_repo_with_commit(&repo_dir);
+
+    command
+        .arg("--diagnostics")
+        .current_dir(&repo_dir)
+        .env("SESHMUX_TUI_TEST_EXIT", "completed")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("Diagnostics enabled:"));
+
+    let diagnostics_dir = temp_home.path().join(".config/seshmux/diagnostics");
+    let logs: Vec<_> = fs::read_dir(&diagnostics_dir)
+        .expect("diagnostics dir")
+        .filter_map(Result::ok)
+        .collect();
+    assert_timestamp_log_names(&logs);
+}
+
+#[test]
+fn doctor_with_diagnostics_creates_log_file() {
+    let (mut command, temp_home) = new_command_with_temp_home();
+    command
+        .args(["--diagnostics", "doctor"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("Diagnostics enabled:"));
+
+    let diagnostics_dir = temp_home.path().join(".config/seshmux/diagnostics");
+    let logs: Vec<_> = fs::read_dir(&diagnostics_dir)
+        .expect("diagnostics dir")
+        .filter_map(Result::ok)
+        .collect();
+    assert_timestamp_log_names(&logs);
 }
