@@ -1,3 +1,7 @@
+mod new;
+
+pub use new::{NewPrepare, NewRequest, NewResult, NewStartPoint};
+
 use anyhow::{Context, Result, anyhow, bail};
 use seshmux_core::command_runner::CommandRunner;
 use seshmux_core::config::{SeshmuxConfig, load_config, resolve_config_path};
@@ -32,21 +36,5 @@ impl<'a> App<'a> {
                 config_path.display()
             )
         })
-    }
-
-    pub fn new_worktree_stub(&self) -> Result<()> {
-        bail!("new flow is not implemented in this milestone")
-    }
-
-    pub fn list_worktrees_stub(&self) -> Result<()> {
-        bail!("list flow is not implemented in this milestone")
-    }
-
-    pub fn attach_worktree_stub(&self) -> Result<()> {
-        bail!("attach flow is not implemented in this milestone")
-    }
-
-    pub fn delete_worktree_stub(&self) -> Result<()> {
-        bail!("delete flow is not implemented in this milestone")
     }
 }

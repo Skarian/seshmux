@@ -7,3 +7,6 @@ license.workspace = true
 [dependencies]
 anyhow.workspace = true
 seshmux-core = { path = "../seshmux-core" }
+
+[dev-dependencies]
+tempfile.workspace = true

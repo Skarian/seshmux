@@ -1,3 +1,9 @@
 pub mod command_runner;
 pub mod config;
 pub mod doctor;
+pub mod extras;
+pub mod git;
+pub mod names;
+pub mod registry;
+pub mod time;
+pub mod tmux;
