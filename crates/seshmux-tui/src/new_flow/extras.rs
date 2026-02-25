@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Component, Path, PathBuf};
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Result, anyhow};
 use crossterm::event::{Event, KeyEvent};
 use tui_input::Input;
 use tui_input::backend::crossterm::EventHandler;
@@ -37,15 +37,15 @@ impl ExtrasState {
         let mut normalized = BTreeSet::new();
 
         for candidate in candidates {
-            let relative = seshmux_core::extras::normalize_extra_relative_path(candidate)
-                .map_err(|error| anyhow!(error.to_string()))?;
+            let relative = match seshmux_core::extras::normalize_extra_relative_path(candidate) {
+                Ok(path) => path,
+                Err(_) => continue,
+            };
             let absolute = repo_root.join(&relative);
 
+            normalized.insert(relative.clone());
             if absolute.is_dir() {
-                normalized.insert(relative.clone());
-                expand_directory(repo_root, &absolute, &mut normalized)?;
-            } else {
-                normalized.insert(relative);
+                expand_directory(repo_root, &absolute, &mut normalized);
             }
         }
 
@@ -54,7 +54,9 @@ impl ExtrasState {
 
         for path in normalized {
             let is_dir = repo_root.join(&path).is_dir();
-            insert_path(&mut nodes, &mut roots, &path, is_dir)?;
+            if insert_path(&mut nodes, &mut roots, &path, is_dir).is_err() {
+                continue;
+            }
         }
 
         let mut state = Self {
@@ -376,30 +378,28 @@ pub(crate) fn identifier_path_for_key(key: &str) -> Vec<String> {
     identifiers
 }
 
-pub(crate) fn expand_directory(
-    repo_root: &Path,
-    directory: &Path,
-    output: &mut BTreeSet<PathBuf>,
-) -> Result<()> {
-    for entry in std::fs::read_dir(directory)
-        .with_context(|| format!("failed to read extra directory {}", directory.display()))?
-    {
-        let entry =
-            entry.with_context(|| format!("failed to read entry in {}", directory.display()))?;
+pub(crate) fn expand_directory(repo_root: &Path, directory: &Path, output: &mut BTreeSet<PathBuf>) {
+    let entries = match std::fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(_) => return,
+    };
+
+    for entry in entries {
+        let Ok(entry) = entry else {
+            continue;
+        };
         let absolute = entry.path();
-        let relative = absolute
-            .strip_prefix(repo_root)
-            .with_context(|| format!("failed to relativize path {}", absolute.display()))?
-            .to_path_buf();
+        let Ok(relative) = absolute.strip_prefix(repo_root) else {
+            continue;
+        };
+        let relative = relative.to_path_buf();
 
         output.insert(relative.clone());
 
         if absolute.is_dir() {
-            expand_directory(repo_root, &absolute, output)?;
+            expand_directory(repo_root, &absolute, output);
         }
     }
-
-    Ok(())
 }
 
 pub(crate) fn insert_path(
@@ -465,4 +465,54 @@ pub(crate) fn insert_path(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::ExtrasState;
+
+    #[test]
+    fn from_candidates_skips_invalid_relative_paths() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let repo_root = temp.path();
+        std::fs::write(repo_root.join("keep.txt"), "ok").expect("write file");
+
+        let state = ExtrasState::from_candidates(
+            repo_root,
+            &[
+                PathBuf::from("../outside.txt"),
+                PathBuf::from("keep.txt"),
+                PathBuf::from("./"),
+            ],
+        )
+        .expect("state");
+
+        assert!(state.nodes.contains_key("keep.txt"));
+        assert!(!state.nodes.contains_key("../outside.txt"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn from_candidates_skips_unreadable_directories() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        let repo_root = temp.path().join("repo");
+        let blocked = repo_root.join("blocked");
+        std::fs::create_dir_all(&blocked).expect("blocked dir");
+        std::fs::write(blocked.join("hidden.txt"), "x").expect("hidden file");
+        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o000))
+            .expect("chmod blocked");
+
+        let state =
+            ExtrasState::from_candidates(&repo_root, &[PathBuf::from("blocked")]).expect("state");
+
+        assert!(state.nodes.contains_key("blocked"));
+        assert!(!state.nodes.contains_key("blocked/hidden.txt"));
+
+        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o755))
+            .expect("restore blocked");
+    }
 }

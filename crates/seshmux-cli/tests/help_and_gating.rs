@@ -4,8 +4,7 @@ use predicates::prelude::*;
 use std::fs;
 
 use support::{
-    assert_timestamp_log_names, init_git_repo, init_git_repo_with_commit,
-    new_command_with_temp_home, write_valid_config,
+    assert_timestamp_log_names, init_git_repo, new_command_with_temp_home, write_valid_config,
 };
 
 #[test]
@@ -71,36 +70,6 @@ fn root_command_is_gated_without_config() {
 }
 
 #[test]
-fn root_command_runs_when_config_exists() {
-    let (mut command, temp_home) = new_command_with_temp_home();
-    write_valid_config(temp_home.path());
-    let repo_dir = temp_home.path().join("repo");
-    init_git_repo_with_commit(&repo_dir);
-
-    command
-        .current_dir(&repo_dir)
-        .env("SESHMUX_TUI_TEST_EXIT", "completed")
-        .assert()
-        .success()
-        .stderr(predicate::str::is_empty());
-}
-
-#[test]
-fn root_command_cancel_is_quiet() {
-    let (mut command, temp_home) = new_command_with_temp_home();
-    write_valid_config(temp_home.path());
-    let repo_dir = temp_home.path().join("repo");
-    init_git_repo_with_commit(&repo_dir);
-
-    command
-        .current_dir(&repo_dir)
-        .env("SESHMUX_TUI_TEST_EXIT", "canceled")
-        .assert()
-        .success()
-        .stdout(predicate::str::is_empty());
-}
-
-#[test]
 fn root_command_fails_outside_git_repo_before_tui() {
     let (mut command, temp_home) = new_command_with_temp_home();
     write_valid_config(temp_home.path());
@@ -126,29 +95,6 @@ fn root_command_fails_in_repo_with_no_commits_before_tui() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("repository has no commits yet"));
-}
-
-#[test]
-fn root_command_with_diagnostics_creates_log_file() {
-    let (mut command, temp_home) = new_command_with_temp_home();
-    write_valid_config(temp_home.path());
-    let repo_dir = temp_home.path().join("repo");
-    init_git_repo_with_commit(&repo_dir);
-
-    command
-        .arg("--diagnostics")
-        .current_dir(&repo_dir)
-        .env("SESHMUX_TUI_TEST_EXIT", "completed")
-        .assert()
-        .success()
-        .stderr(predicate::str::contains("Diagnostics enabled:"));
-
-    let diagnostics_dir = temp_home.path().join(".config/seshmux/diagnostics");
-    let logs: Vec<_> = fs::read_dir(&diagnostics_dir)
-        .expect("diagnostics dir")
-        .filter_map(Result::ok)
-        .collect();
-    assert_timestamp_log_names(&logs);
 }
 
 #[test]

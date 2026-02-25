@@ -43,41 +43,6 @@ pub fn init_git_repo(path: &Path) {
     );
 }
 
-pub fn init_git_repo_with_commit(path: &Path) {
-    init_git_repo(path);
-    fs::write(path.join("README.md"), "hello\n").expect("write readme");
-
-    let add_output = StdCommand::new("git")
-        .args(["add", "."])
-        .current_dir(path)
-        .output()
-        .expect("git add");
-    assert!(
-        add_output.status.success(),
-        "git add failed: {}",
-        String::from_utf8_lossy(&add_output.stderr)
-    );
-
-    let commit_output = StdCommand::new("git")
-        .args([
-            "-c",
-            "user.name=seshmux-test",
-            "-c",
-            "user.email=seshmux-test@example.com",
-            "commit",
-            "-m",
-            "initial",
-        ])
-        .current_dir(path)
-        .output()
-        .expect("git commit");
-    assert!(
-        commit_output.status.success(),
-        "git commit failed: {}",
-        String::from_utf8_lossy(&commit_output.stderr)
-    );
-}
-
 pub fn assert_timestamp_log_names(entries: &[std::fs::DirEntry]) {
     assert!(!entries.is_empty(), "expected at least one diagnostics log");
 

@@ -80,7 +80,14 @@ fn delete_removes_worktree_folder_and_registry_entry_in_real_repo() {
         })
         .expect("delete should succeed");
 
+    let expected_repo_root = repo_root.canonicalize().expect("canonical repo root");
+    let actual_repo_root = result
+        .repo_root
+        .canonicalize()
+        .expect("canonical reported repo root");
+
     assert_eq!(result.worktree_name, "w1");
+    assert_eq!(actual_repo_root, expected_repo_root);
     assert!(!result.branch_deleted);
     assert!(result.branch_delete_error.is_none());
     assert!(!worktree_path.exists());

@@ -152,6 +152,7 @@ fn delete_with_all_options_kills_session_removes_worktree_and_branch() {
         .expect("delete result");
 
     assert_eq!(result.worktree_path, worktree_path);
+    assert_eq!(result.repo_root, repo_root);
     assert!(result.branch_deleted);
     assert!(result.branch_delete_error.is_none());
     assert!(load_registry(&repo_root).expect("registry load").is_empty());
@@ -185,6 +186,7 @@ fn delete_keeps_branch_when_not_fully_merged() {
         .expect("delete should still succeed");
 
     assert!(!result.branch_deleted);
+    assert_eq!(result.repo_root, repo_root);
     assert!(
         result
             .branch_delete_error

@@ -20,7 +20,7 @@ use crate::ui::worktree_table::{TableColumn, WorktreeTableRender};
 pub(crate) trait DeleteFlowOps {
     fn list_worktrees(&self, cwd: &Path) -> Result<ListResult>;
     fn delete_worktree(&self, request: DeleteRequest) -> Result<DeleteResult>;
-    fn force_delete_branch(&self, cwd: &Path, branch_name: &str) -> Result<()>;
+    fn force_delete_branch(&self, repo_root: &Path, branch_name: &str) -> Result<()>;
 }
 
 impl<'a> DeleteFlowOps for App<'a> {
@@ -32,8 +32,8 @@ impl<'a> DeleteFlowOps for App<'a> {
         self.delete(request)
     }
 
-    fn force_delete_branch(&self, cwd: &Path, branch_name: &str) -> Result<()> {
-        App::force_delete_branch(self, cwd.to_path_buf(), branch_name.to_string())
+    fn force_delete_branch(&self, repo_root: &Path, branch_name: &str) -> Result<()> {
+        App::force_delete_branch(self, repo_root.to_path_buf(), branch_name.to_string())
     }
 }
 
@@ -271,7 +271,7 @@ impl DeleteFlow {
                     return Ok(FlowSignal::Continue);
                 };
 
-                match ops.force_delete_branch(&self.cwd, &result.branch_name) {
+                match ops.force_delete_branch(&result.repo_root, &result.branch_name) {
                     Ok(()) => {
                         result.branch_deleted = true;
                         result.branch_delete_error = None;
@@ -670,7 +670,7 @@ mod tests {
     struct FakeOps {
         rows: Vec<WorktreeRow>,
         delete_calls: RefCell<Vec<DeleteRequest>>,
-        force_branch_calls: RefCell<Vec<String>>,
+        force_branch_calls: RefCell<Vec<(PathBuf, String)>>,
         worktree_delete_fail_once: RefCell<bool>,
         branch_safe_fails: bool,
         branch_force_fails: bool,
@@ -730,6 +730,7 @@ mod tests {
 
             Ok(DeleteResult {
                 worktree_name: request.worktree_name,
+                repo_root: PathBuf::from("/tmp/repo"),
                 worktree_path: PathBuf::from("/tmp/repo/worktrees/w1"),
                 session_name: "repo/w1".to_string(),
                 branch_name: "w1".to_string(),
@@ -738,10 +739,10 @@ mod tests {
             })
         }
 
-        fn force_delete_branch(&self, _cwd: &Path, branch_name: &str) -> Result<()> {
+        fn force_delete_branch(&self, repo_root: &Path, branch_name: &str) -> Result<()> {
             self.force_branch_calls
                 .borrow_mut()
-                .push(branch_name.to_string());
+                .push((repo_root.to_path_buf(), branch_name.to_string()));
             if self.branch_force_fails {
                 return Err(anyhow!(
                     "force delete failed: branch is checked out in another worktree"
@@ -902,7 +903,10 @@ mod tests {
 
         assert_eq!(flow.step, Step::Success);
         let calls = ops.force_branch_calls.borrow();
-        assert_eq!(calls.as_slice(), ["w1"]);
+        assert_eq!(
+            calls.as_slice(),
+            [(PathBuf::from("/tmp/repo"), "w1".to_string())]
+        );
     }
 
     #[test]

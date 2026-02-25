@@ -201,15 +201,6 @@ enum Transition {
 }
 
 pub fn run_root(app: &App<'_>, cwd: &Path) -> Result<UiExit> {
-    if let Ok(exit) = std::env::var("SESHMUX_TUI_TEST_EXIT") {
-        return Ok(match exit.as_str() {
-            "completed" => UiExit::Completed,
-            "back" => UiExit::BackAtRoot,
-            "canceled" => UiExit::Canceled,
-            _ => UiExit::Completed,
-        });
-    }
-
     let mut session = TerminalSession::enter()?;
     let mut active = ActiveScreen::Root(RootScreen::new());
     let mut global_error: Option<String> = None;

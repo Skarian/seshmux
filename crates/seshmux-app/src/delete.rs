@@ -4,7 +4,6 @@ use anyhow::{Context, Result, bail};
 use thiserror::Error;
 
 use crate::App;
-use crate::runtime;
 use crate::target;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -19,6 +18,7 @@ pub struct DeleteRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeleteResult {
     pub worktree_name: String,
+    pub repo_root: PathBuf,
     pub worktree_path: PathBuf,
     pub session_name: String,
     pub branch_name: String,
@@ -116,6 +116,7 @@ impl<'a> App<'a> {
 
         Ok(DeleteResult {
             worktree_name,
+            repo_root,
             worktree_path,
             session_name,
             branch_name,
@@ -124,8 +125,7 @@ impl<'a> App<'a> {
         })
     }
 
-    pub fn force_delete_branch(&self, cwd: PathBuf, branch_name: String) -> Result<()> {
-        let repo_root = runtime::resolve_repo_root(self, &cwd)?;
+    pub fn force_delete_branch(&self, repo_root: PathBuf, branch_name: String) -> Result<()> {
         seshmux_core::git::force_delete_branch(&repo_root, &branch_name, self.runner)
             .with_context(|| format!("failed to force delete branch '{branch_name}'"))?;
         Ok(())
