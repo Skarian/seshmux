@@ -4,7 +4,6 @@ use anyhow::Result;
 use comfy_table::{Cell, ContentArrangement, Table};
 use seshmux_app::App;
 use seshmux_core::doctor::{CheckState, DoctorReport};
-use seshmux_tui::UiExit;
 
 use crate::cli::{Cli, Command};
 
@@ -19,9 +18,7 @@ fn run_root_command(app: &App<'_>, cwd: &Path) -> Result<()> {
     app.ensure_config_ready()?;
     app.ensure_runtime_repo_ready(cwd)?;
 
-    if matches!(seshmux_tui::run_root(app, cwd)?, UiExit::Canceled) {
-        println!("Canceled.");
-    }
+    let _ = seshmux_tui::run_root(app, cwd)?;
 
     Ok(())
 }

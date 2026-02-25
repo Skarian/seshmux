@@ -34,6 +34,7 @@ pub enum UiExit {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RootMenuExit {
     Action(RootAction),
+    Exit,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -85,6 +86,13 @@ impl TerminalSession {
             .context("failed to render terminal")?;
         Ok(())
     }
+
+    pub(crate) fn autoresize(&mut self) -> Result<()> {
+        self.terminal
+            .autoresize()
+            .context("failed to autoresize terminal")?;
+        Ok(())
+    }
 }
 
 impl Drop for TerminalSession {
@@ -96,21 +104,6 @@ impl Drop for TerminalSession {
 
 pub(crate) fn is_ctrl_c(key: KeyEvent) -> bool {
     key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c')
-}
-
-fn read_key_event() -> Result<KeyEvent> {
-    loop {
-        let event = event::read().context("failed to read terminal event")?;
-        let Event::Key(key) = event else {
-            continue;
-        };
-
-        if !matches!(key.kind, KeyEventKind::Press) {
-            continue;
-        }
-
-        return Ok(key);
-    }
 }
 
 #[derive(Debug)]
@@ -125,12 +118,12 @@ impl RootScreen {
 
     fn on_key(&mut self, key: KeyEvent) -> Option<RootMenuExit> {
         match key.code {
-            KeyCode::Esc => None,
-            KeyCode::Up => {
+            KeyCode::Esc | KeyCode::Char('q') => Some(RootMenuExit::Exit),
+            KeyCode::Up | KeyCode::Char('k') => {
                 self.selected = self.selected.saturating_sub(1);
                 None
             }
-            KeyCode::Down => {
+            KeyCode::Down | KeyCode::Char('j') => {
                 if self.selected + 1 < ROOT_ACTIONS.len() {
                     self.selected += 1;
                 }
@@ -176,7 +169,7 @@ impl RootScreen {
         state.select(Some(self.selected));
         frame.render_stateful_widget(list, body, &mut state);
 
-        let hints = Paragraph::new("Enter: select    Up/Down: move    Ctrl+C: cancel")
+        let hints = Paragraph::new("Enter: select    Up/Down or j/k: move    Esc/q: exit")
             .block(Block::default().borders(Borders::ALL).title("Keys"));
         frame.render_widget(hints, footer);
     }
@@ -217,16 +210,26 @@ pub fn run_root(app: &App<'_>, cwd: &Path) -> Result<UiExit> {
             ActiveScreen::Delete(screen) => screen.render(frame),
         })?;
 
-        let key = read_key_event()?;
+        let event = event::read().context("failed to read terminal event")?;
+        let key = match event {
+            Event::Resize(_, _) => {
+                session.autoresize()?;
+                continue;
+            }
+            Event::Key(key) if matches!(key.kind, KeyEventKind::Press) => key,
+            _ => continue,
+        };
 
         if is_ctrl_c(key) {
             return Ok(UiExit::Canceled);
         }
 
         let transition = match &mut active {
-            ActiveScreen::Root(screen) => screen
-                .on_key(key)
-                .map(|RootMenuExit::Action(action)| Transition::Open(action)),
+            ActiveScreen::Root(screen) => match screen.on_key(key) {
+                Some(RootMenuExit::Action(action)) => Some(Transition::Open(action)),
+                Some(RootMenuExit::Exit) => Some(Transition::Return(UiExit::Completed)),
+                None => None,
+            },
             ActiveScreen::New(screen) => screen.on_key(key, app)?.map(Transition::Return),
             ActiveScreen::List(screen) => screen.on_key(key, app)?.map(Transition::Return),
             ActiveScreen::Attach(screen) => screen.on_key(key, app)?.map(Transition::Return),
@@ -249,12 +252,11 @@ pub fn run_root(app: &App<'_>, cwd: &Path) -> Result<UiExit> {
                         }
                     };
                 }
-                Transition::Return(exit) => match exit {
-                    UiExit::BackAtRoot | UiExit::Completed => {
-                        active = ActiveScreen::Root(RootScreen::new());
-                    }
-                    UiExit::Canceled => return Ok(UiExit::Canceled),
-                },
+                Transition::Return(UiExit::Canceled) => return Ok(UiExit::Canceled),
+                Transition::Return(UiExit::Completed) => return Ok(UiExit::Completed),
+                Transition::Return(UiExit::BackAtRoot) => {
+                    active = ActiveScreen::Root(RootScreen::new());
+                }
             }
         }
     }
@@ -289,9 +291,14 @@ pub(crate) fn centered_rect(
 
 #[cfg(test)]
 mod tests {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::layout::Rect;
 
-    use super::centered_rect;
+    use super::{RootMenuExit, RootScreen, centered_rect};
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
 
     #[test]
     fn centered_rect_returns_middle_segment() {
@@ -310,5 +317,26 @@ mod tests {
         let centered = centered_rect(120, 150, area);
 
         assert_eq!(centered, area);
+    }
+
+    #[test]
+    fn root_screen_esc_and_q_exit() {
+        let mut root = RootScreen::new();
+        assert_eq!(root.on_key(key(KeyCode::Esc)), Some(RootMenuExit::Exit));
+        assert_eq!(
+            root.on_key(key(KeyCode::Char('q'))),
+            Some(RootMenuExit::Exit)
+        );
+    }
+
+    #[test]
+    fn root_screen_supports_j_and_k_navigation() {
+        let mut root = RootScreen::new();
+        let _ = root.on_key(key(KeyCode::Char('j')));
+        let _ = root.on_key(key(KeyCode::Char('j')));
+        assert_eq!(root.selected, 2);
+
+        let _ = root.on_key(key(KeyCode::Char('k')));
+        assert_eq!(root.selected, 1);
     }
 }

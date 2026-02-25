@@ -179,7 +179,7 @@ fn root_command_runs_when_config_exists() {
 }
 
 #[test]
-fn root_command_prints_cancel_message() {
+fn root_command_cancel_is_quiet() {
     let (mut command, temp_home) = new_command_with_temp_home();
     write_valid_config(temp_home.path());
     let repo_dir = temp_home.path().join("repo");
@@ -190,7 +190,7 @@ fn root_command_prints_cancel_message() {
         .env("SESHMUX_TUI_TEST_EXIT", "canceled")
         .assert()
         .success()
-        .stdout(predicate::str::contains("Canceled."));
+        .stdout(predicate::str::is_empty());
 }
 
 #[test]

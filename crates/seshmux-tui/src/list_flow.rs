@@ -71,11 +71,11 @@ impl ListFlow {
     fn on_key(&mut self, key: KeyEvent, ops: &dyn ListFlowOps, cwd: &Path) -> Result<FlowSignal> {
         match key.code {
             KeyCode::Esc => Ok(FlowSignal::Exit(UiExit::BackAtRoot)),
-            KeyCode::Up => {
+            KeyCode::Up | KeyCode::Char('k') => {
                 self.selected = self.selected.saturating_sub(1);
                 Ok(FlowSignal::Continue)
             }
-            KeyCode::Down => {
+            KeyCode::Down | KeyCode::Char('j') => {
                 if self.selected + 1 < self.rows.len() {
                     self.selected += 1;
                 }
@@ -173,9 +173,8 @@ impl ListFlow {
             );
         }
 
-        let keys =
-            Paragraph::new("Up/Down: move    Enter/r: refresh    Esc: back    Ctrl+C: cancel")
-                .block(Block::default().borders(Borders::ALL).title("Keys"));
+        let keys = Paragraph::new("Up/Down or j/k: move    Enter/r: refresh    Esc: back")
+            .block(Block::default().borders(Borders::ALL).title("Keys"));
         frame.render_widget(keys, footer);
     }
 }
@@ -215,5 +214,38 @@ mod tests {
             .on_key(key(KeyCode::Esc), &ops, Path::new("/tmp/repo"))
             .expect("signal");
         assert_eq!(signal, FlowSignal::Exit(super::UiExit::BackAtRoot));
+    }
+
+    #[test]
+    fn vim_navigation_moves_selection() {
+        let ops = FakeOps {
+            rows: vec![
+                WorktreeRow {
+                    name: "w1".to_string(),
+                    path: PathBuf::from("/tmp/repo/worktrees/w1"),
+                    created_at: "2026-02-25T10:00:00Z".to_string(),
+                    branch: "w1".to_string(),
+                    session_name: "repo/w1".to_string(),
+                    session_running: false,
+                },
+                WorktreeRow {
+                    name: "w2".to_string(),
+                    path: PathBuf::from("/tmp/repo/worktrees/w2"),
+                    created_at: "2026-02-25T11:00:00Z".to_string(),
+                    branch: "w2".to_string(),
+                    session_name: "repo/w2".to_string(),
+                    session_running: false,
+                },
+            ],
+        };
+        let mut flow = ListFlow::new(&ops, Path::new("/tmp/repo")).expect("flow");
+
+        flow.on_key(key(KeyCode::Char('j')), &ops, Path::new("/tmp/repo"))
+            .expect("down");
+        assert_eq!(flow.selected, 1);
+
+        flow.on_key(key(KeyCode::Char('k')), &ops, Path::new("/tmp/repo"))
+            .expect("up");
+        assert_eq!(flow.selected, 0);
     }
 }

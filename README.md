@@ -70,5 +70,5 @@ The root TUI menu includes:
 
 ## Key Semantics
 
-- `Esc`: back one step. On first step of a flow, exits that flow.
-- `Ctrl+C`: cancel the active command flow.
+- `Esc`: back one step inside flows. On first step of a flow, returns to root. From root, exits the TUI.
+- `q`: exits the TUI from root.

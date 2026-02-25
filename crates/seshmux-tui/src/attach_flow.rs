@@ -111,11 +111,11 @@ impl AttachFlow {
     fn on_key_select(&mut self, key: KeyEvent, ops: &dyn AttachFlowOps) -> Result<FlowSignal> {
         match key.code {
             KeyCode::Esc => Ok(FlowSignal::Exit(UiExit::BackAtRoot)),
-            KeyCode::Up => {
+            KeyCode::Up | KeyCode::Char('k') => {
                 self.selected = self.selected.saturating_sub(1);
                 Ok(FlowSignal::Continue)
             }
-            KeyCode::Down => {
+            KeyCode::Down | KeyCode::Char('j') => {
                 if self.selected + 1 < self.filtered.len() {
                     self.selected += 1;
                 }
@@ -172,12 +172,12 @@ impl AttachFlow {
                 self.step = Step::SelectWorktree;
                 Ok(FlowSignal::Continue)
             }
-            KeyCode::Left | KeyCode::Up => {
-                self.missing_yes_selected = true;
+            KeyCode::Left | KeyCode::Char('h') | KeyCode::Char('n') => {
+                self.missing_yes_selected = false;
                 Ok(FlowSignal::Continue)
             }
-            KeyCode::Right | KeyCode::Down => {
-                self.missing_yes_selected = false;
+            KeyCode::Right | KeyCode::Char('l') | KeyCode::Char('y') => {
+                self.missing_yes_selected = true;
                 Ok(FlowSignal::Continue)
             }
             KeyCode::Enter => {
@@ -357,8 +357,9 @@ impl AttachFlow {
             );
         }
 
-        let keys = Paragraph::new("Type: filter    Enter: attach    Up/Down: move    Esc: back")
-            .block(Block::default().borders(Borders::ALL).title("Keys"));
+        let keys =
+            Paragraph::new("Type: filter    Enter: attach    Up/Down or j/k: move    Esc: back")
+                .block(Block::default().borders(Borders::ALL).title("Keys"));
         frame.render_widget(keys, footer);
     }
 
@@ -393,7 +394,7 @@ impl AttachFlow {
             .as_deref()
             .unwrap_or("UNCONFIRMED");
         let text = format!(
-            "No tmux session found for '{worktree}'.\nWould you like to create one?\n\nSelection: {selection}\n\nLeft/Right: choose    Enter: continue    Esc: back"
+            "No tmux session found for '{worktree}'.\nWould you like to create one?\n\nSelection: {selection}\n\nLeft/Right or h/l: choose    y/n: choose    Enter: continue    Esc: back"
         );
         let widget =
             Paragraph::new(text).block(Block::default().borders(Borders::ALL).title("Attach"));
@@ -536,5 +537,29 @@ mod tests {
         assert_eq!(flow.step, Step::SelectWorktree);
         let calls = ops.attach_calls.borrow();
         assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn missing_session_prompt_supports_h_and_l_selection() {
+        let ops = FakeOps::new();
+        let mut flow = AttachFlow::new(&ops, Path::new("/tmp/repo")).expect("flow");
+
+        flow.on_key(key(KeyCode::Enter), &ops)
+            .expect("attempt attach");
+        assert_eq!(flow.step, Step::MissingSessionPrompt);
+
+        flow.on_key(key(KeyCode::Char('h')), &ops)
+            .expect("choose no");
+        flow.on_key(key(KeyCode::Enter), &ops)
+            .expect("decline create");
+        assert_eq!(flow.step, Step::SelectWorktree);
+
+        flow.on_key(key(KeyCode::Enter), &ops)
+            .expect("attempt attach again");
+        flow.on_key(key(KeyCode::Char('l')), &ops)
+            .expect("choose yes");
+        flow.on_key(key(KeyCode::Enter), &ops)
+            .expect("confirm create");
+        assert_eq!(flow.step, Step::Success);
     }
 }

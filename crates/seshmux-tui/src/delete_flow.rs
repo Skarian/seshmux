@@ -8,7 +8,7 @@ use ratatui::widgets::{
     Block, Borders, Clear, Paragraph, Row, Scrollbar, ScrollbarOrientation, ScrollbarState, Table,
     TableState,
 };
-use seshmux_app::{App, DeleteError, DeleteRequest, DeleteResult, ListResult, WorktreeRow};
+use seshmux_app::{App, DeleteRequest, DeleteResult, ListResult, WorktreeRow};
 use tui_input::Input;
 use tui_input::backend::crossterm::EventHandler;
 
@@ -17,7 +17,6 @@ use crate::{UiExit, centered_rect};
 pub(crate) trait DeleteFlowOps {
     fn list_worktrees(&self, cwd: &Path) -> Result<ListResult>;
     fn delete_worktree(&self, request: DeleteRequest) -> Result<DeleteResult>;
-    fn force_delete_branch(&self, cwd: &Path, branch_name: &str) -> Result<()>;
 }
 
 impl<'a> DeleteFlowOps for App<'a> {
@@ -28,19 +27,13 @@ impl<'a> DeleteFlowOps for App<'a> {
     fn delete_worktree(&self, request: DeleteRequest) -> Result<DeleteResult> {
         self.delete(request)
     }
-
-    fn force_delete_branch(&self, cwd: &Path, branch_name: &str) -> Result<()> {
-        self.force_delete_branch(cwd, branch_name)
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Step {
     SelectWorktree,
-    ConfirmDelete,
-    ConfirmKillSession,
-    ConfirmDeleteBranch,
-    ConfirmForceBranchDelete,
+    Options,
+    Confirm,
     Notice,
     Success,
     Error,
@@ -52,6 +45,18 @@ enum FlowSignal {
     Exit(UiExit),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OptionField {
+    KillSession,
+    DeleteBranch,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DeleteOptions {
+    kill_tmux_session: bool,
+    delete_branch: bool,
+}
+
 #[derive(Debug)]
 struct DeleteFlow {
     cwd: PathBuf,
@@ -61,11 +66,9 @@ struct DeleteFlow {
     selected: usize,
     query: Input,
     target: Option<WorktreeRow>,
-    confirm_yes_selected: bool,
-    kill_yes_selected: bool,
-    delete_branch_yes_selected: bool,
-    force_delete_yes_selected: bool,
-    pending_branch_for_force: Option<String>,
+    options: DeleteOptions,
+    option_selected: usize,
+    confirm_execute: bool,
     success_message: Option<String>,
     error_message: Option<String>,
 }
@@ -104,11 +107,12 @@ impl DeleteFlow {
             selected: 0,
             query: Input::default(),
             target: None,
-            confirm_yes_selected: true,
-            kill_yes_selected: false,
-            delete_branch_yes_selected: false,
-            force_delete_yes_selected: false,
-            pending_branch_for_force: None,
+            options: DeleteOptions {
+                kill_tmux_session: false,
+                delete_branch: false,
+            },
+            option_selected: 0,
+            confirm_execute: false,
             success_message: None,
             error_message: None,
         };
@@ -119,10 +123,8 @@ impl DeleteFlow {
     fn on_key(&mut self, key: KeyEvent, ops: &dyn DeleteFlowOps) -> Result<FlowSignal> {
         match self.step {
             Step::SelectWorktree => Ok(self.on_key_select(key)),
-            Step::ConfirmDelete => Ok(self.on_key_confirm_delete(key)),
-            Step::ConfirmKillSession => Ok(self.on_key_confirm_kill_session(key)),
-            Step::ConfirmDeleteBranch => self.on_key_confirm_delete_branch(key, ops),
-            Step::ConfirmForceBranchDelete => self.on_key_confirm_force_branch_delete(key, ops),
+            Step::Options => Ok(self.on_key_options(key)),
+            Step::Confirm => self.on_key_confirm(key, ops),
             Step::Notice => Ok(self.on_key_notice(key)),
             Step::Success => Ok(self.on_key_success(key)),
             Step::Error => Ok(self.on_key_error(key)),
@@ -132,11 +134,11 @@ impl DeleteFlow {
     fn on_key_select(&mut self, key: KeyEvent) -> FlowSignal {
         match key.code {
             KeyCode::Esc => FlowSignal::Exit(UiExit::BackAtRoot),
-            KeyCode::Up => {
+            KeyCode::Up | KeyCode::Char('k') => {
                 self.selected = self.selected.saturating_sub(1);
                 FlowSignal::Continue
             }
-            KeyCode::Down => {
+            KeyCode::Down | KeyCode::Char('j') => {
                 if self.selected + 1 < self.filtered.len() {
                     self.selected += 1;
                 }
@@ -146,12 +148,13 @@ impl DeleteFlow {
                 let Some(target) = self.selected_row().cloned() else {
                     return FlowSignal::Continue;
                 };
-
                 self.target = Some(target);
-                self.confirm_yes_selected = true;
-                self.delete_branch_yes_selected = false;
-                self.kill_yes_selected = false;
-                self.step = Step::ConfirmDelete;
+                self.options = DeleteOptions {
+                    kill_tmux_session: false,
+                    delete_branch: false,
+                };
+                self.option_selected = 0;
+                self.step = Step::Options;
                 FlowSignal::Continue
             }
             _ => {
@@ -163,185 +166,66 @@ impl DeleteFlow {
         }
     }
 
-    fn on_key_confirm_delete(&mut self, key: KeyEvent) -> FlowSignal {
+    fn on_key_options(&mut self, key: KeyEvent) -> FlowSignal {
         match key.code {
             KeyCode::Esc => {
                 self.step = Step::SelectWorktree;
                 FlowSignal::Continue
             }
-            KeyCode::Left | KeyCode::Up => {
-                self.confirm_yes_selected = true;
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.option_selected = self.option_selected.saturating_sub(1);
                 FlowSignal::Continue
             }
-            KeyCode::Char(character) if character == 'y' || character == 'Y' => {
-                self.confirm_yes_selected = true;
+            KeyCode::Down | KeyCode::Char('j') => {
+                if self.option_selected + 1 < self.option_fields().len() {
+                    self.option_selected += 1;
+                }
                 FlowSignal::Continue
             }
-            KeyCode::Right | KeyCode::Down => {
-                self.confirm_yes_selected = false;
+            KeyCode::Left | KeyCode::Char('h') | KeyCode::Char('n') => {
+                self.set_current_option(false);
                 FlowSignal::Continue
             }
-            KeyCode::Char(character) if character == 'n' || character == 'N' => {
-                self.confirm_yes_selected = false;
+            KeyCode::Right | KeyCode::Char('l') | KeyCode::Char('y') => {
+                self.set_current_option(true);
+                FlowSignal::Continue
+            }
+            KeyCode::Char(' ') => {
+                self.toggle_current_option();
                 FlowSignal::Continue
             }
             KeyCode::Enter => {
-                if !self.confirm_yes_selected {
+                self.confirm_execute = false;
+                self.step = Step::Confirm;
+                FlowSignal::Continue
+            }
+            _ => FlowSignal::Continue,
+        }
+    }
+
+    fn on_key_confirm(&mut self, key: KeyEvent, ops: &dyn DeleteFlowOps) -> Result<FlowSignal> {
+        match key.code {
+            KeyCode::Esc => {
+                self.step = Step::Options;
+                Ok(FlowSignal::Continue)
+            }
+            KeyCode::Left | KeyCode::Char('h') | KeyCode::Char('n') => {
+                self.confirm_execute = false;
+                Ok(FlowSignal::Continue)
+            }
+            KeyCode::Right | KeyCode::Char('l') | KeyCode::Char('y') => {
+                self.confirm_execute = true;
+                Ok(FlowSignal::Continue)
+            }
+            KeyCode::Enter => {
+                if !self.confirm_execute {
                     self.success_message =
                         Some("Delete canceled. No changes were made.".to_string());
                     self.step = Step::Notice;
-                    return FlowSignal::Continue;
-                }
-
-                if self
-                    .target
-                    .as_ref()
-                    .map(|value| value.session_running)
-                    .unwrap_or(false)
-                {
-                    self.kill_yes_selected = false;
-                    self.step = Step::ConfirmKillSession;
-                } else {
-                    self.delete_branch_yes_selected = false;
-                    self.step = Step::ConfirmDeleteBranch;
-                }
-
-                FlowSignal::Continue
-            }
-            _ => FlowSignal::Continue,
-        }
-    }
-
-    fn on_key_confirm_kill_session(&mut self, key: KeyEvent) -> FlowSignal {
-        match key.code {
-            KeyCode::Esc => {
-                self.step = Step::ConfirmDelete;
-                FlowSignal::Continue
-            }
-            KeyCode::Left | KeyCode::Up => {
-                self.kill_yes_selected = true;
-                FlowSignal::Continue
-            }
-            KeyCode::Char(character) if character == 'y' || character == 'Y' => {
-                self.kill_yes_selected = true;
-                FlowSignal::Continue
-            }
-            KeyCode::Right | KeyCode::Down => {
-                self.kill_yes_selected = false;
-                FlowSignal::Continue
-            }
-            KeyCode::Char(character) if character == 'n' || character == 'N' => {
-                self.kill_yes_selected = false;
-                FlowSignal::Continue
-            }
-            KeyCode::Enter => {
-                self.delete_branch_yes_selected = false;
-                self.step = Step::ConfirmDeleteBranch;
-                FlowSignal::Continue
-            }
-            _ => FlowSignal::Continue,
-        }
-    }
-
-    fn on_key_confirm_delete_branch(
-        &mut self,
-        key: KeyEvent,
-        ops: &dyn DeleteFlowOps,
-    ) -> Result<FlowSignal> {
-        match key.code {
-            KeyCode::Esc => {
-                if self
-                    .target
-                    .as_ref()
-                    .map(|value| value.session_running)
-                    .unwrap_or(false)
-                {
-                    self.step = Step::ConfirmKillSession;
-                } else {
-                    self.step = Step::ConfirmDelete;
-                }
-                Ok(FlowSignal::Continue)
-            }
-            KeyCode::Left | KeyCode::Up => {
-                self.delete_branch_yes_selected = true;
-                Ok(FlowSignal::Continue)
-            }
-            KeyCode::Char(character) if character == 'y' || character == 'Y' => {
-                self.delete_branch_yes_selected = true;
-                Ok(FlowSignal::Continue)
-            }
-            KeyCode::Right | KeyCode::Down => {
-                self.delete_branch_yes_selected = false;
-                Ok(FlowSignal::Continue)
-            }
-            KeyCode::Char(character) if character == 'n' || character == 'N' => {
-                self.delete_branch_yes_selected = false;
-                Ok(FlowSignal::Continue)
-            }
-            KeyCode::Enter => {
-                self.execute_delete(ops)?;
-                Ok(FlowSignal::Continue)
-            }
-            _ => Ok(FlowSignal::Continue),
-        }
-    }
-
-    fn on_key_confirm_force_branch_delete(
-        &mut self,
-        key: KeyEvent,
-        ops: &dyn DeleteFlowOps,
-    ) -> Result<FlowSignal> {
-        match key.code {
-            KeyCode::Esc => {
-                self.success_message =
-                    Some("Worktree removed. Branch kept (not force deleted).".to_string());
-                self.error_message = None;
-                self.step = Step::Success;
-                Ok(FlowSignal::Continue)
-            }
-            KeyCode::Left | KeyCode::Up => {
-                self.force_delete_yes_selected = true;
-                Ok(FlowSignal::Continue)
-            }
-            KeyCode::Char(character) if character == 'y' || character == 'Y' => {
-                self.force_delete_yes_selected = true;
-                Ok(FlowSignal::Continue)
-            }
-            KeyCode::Right | KeyCode::Down => {
-                self.force_delete_yes_selected = false;
-                Ok(FlowSignal::Continue)
-            }
-            KeyCode::Char(character) if character == 'n' || character == 'N' => {
-                self.force_delete_yes_selected = false;
-                Ok(FlowSignal::Continue)
-            }
-            KeyCode::Enter if !self.force_delete_yes_selected => {
-                self.success_message =
-                    Some("Worktree removed. Branch kept (not force deleted).".to_string());
-                self.error_message = None;
-                self.step = Step::Success;
-                Ok(FlowSignal::Continue)
-            }
-            KeyCode::Enter => {
-                let Some(branch_name) = self.pending_branch_for_force.clone() else {
-                    self.step = Step::Error;
-                    self.error_message = Some("missing branch name for force delete".to_string());
                     return Ok(FlowSignal::Continue);
-                };
-
-                match ops.force_delete_branch(&self.cwd, &branch_name) {
-                    Ok(()) => {
-                        self.success_message = Some(format!(
-                            "Worktree removed and branch '{branch_name}' force deleted."
-                        ));
-                        self.step = Step::Success;
-                        self.error_message = None;
-                    }
-                    Err(error) => {
-                        self.error_message = Some(error.to_string());
-                        self.step = Step::Error;
-                    }
                 }
+
+                self.execute_delete(ops)?;
                 Ok(FlowSignal::Continue)
             }
             _ => Ok(FlowSignal::Continue),
@@ -385,13 +269,23 @@ impl DeleteFlow {
         match ops.delete_worktree(DeleteRequest {
             cwd: self.cwd.clone(),
             worktree_name: target.name.clone(),
-            kill_tmux_session: self.kill_yes_selected,
-            delete_branch: self.delete_branch_yes_selected,
+            kill_tmux_session: self.options.kill_tmux_session,
+            delete_branch: self.options.delete_branch,
         }) {
             Ok(result) => {
+                let branch_summary = if self.options.delete_branch {
+                    if result.branch_deleted {
+                        "deleted".to_string()
+                    } else {
+                        "kept (not fully merged)".to_string()
+                    }
+                } else {
+                    "kept (not requested)".to_string()
+                };
+
                 self.success_message = Some(format!(
-                    "Deleted worktree '{}'. Session '{}'. Branch deleted: {}.",
-                    result.worktree_name, result.session_name, result.branch_deleted
+                    "Deleted worktree '{}'. Session '{}'. Branch: {}.",
+                    result.worktree_name, result.session_name, branch_summary
                 ));
                 self.error_message = None;
                 self.rows.retain(|row| row.name != result.worktree_name);
@@ -399,19 +293,46 @@ impl DeleteFlow {
                 self.step = Step::Success;
             }
             Err(error) => {
-                if let Some(DeleteError::BranchRequiresForce { branch }) =
-                    error.downcast_ref::<DeleteError>()
-                {
-                    self.pending_branch_for_force = Some(branch.clone());
-                    self.force_delete_yes_selected = false;
-                    self.step = Step::ConfirmForceBranchDelete;
-                } else {
-                    self.error_message = Some(error.to_string());
-                    self.step = Step::Error;
-                }
+                self.error_message = Some(error.to_string());
+                self.step = Step::Error;
             }
         }
+
         Ok(())
+    }
+
+    fn option_fields(&self) -> [OptionField; 2] {
+        [OptionField::KillSession, OptionField::DeleteBranch]
+    }
+
+    fn selected_option_field(&self) -> OptionField {
+        self.option_fields()[self.option_selected]
+    }
+
+    fn set_current_option(&mut self, value: bool) {
+        match self.selected_option_field() {
+            OptionField::KillSession => {
+                if self
+                    .target
+                    .as_ref()
+                    .map(|value| value.session_running)
+                    .unwrap_or(false)
+                {
+                    self.options.kill_tmux_session = value;
+                }
+            }
+            OptionField::DeleteBranch => {
+                self.options.delete_branch = value;
+            }
+        }
+    }
+
+    fn toggle_current_option(&mut self) {
+        let next = match self.selected_option_field() {
+            OptionField::KillSession => !self.options.kill_tmux_session,
+            OptionField::DeleteBranch => !self.options.delete_branch,
+        };
+        self.set_current_option(next);
     }
 
     fn refresh_filtered(&mut self) {
@@ -448,10 +369,8 @@ impl DeleteFlow {
     fn render(&self, frame: &mut ratatui::Frame<'_>) {
         match self.step {
             Step::SelectWorktree => self.render_select(frame),
-            Step::ConfirmDelete => self.render_confirm_delete(frame),
-            Step::ConfirmKillSession => self.render_confirm_kill_session(frame),
-            Step::ConfirmDeleteBranch => self.render_confirm_delete_branch(frame),
-            Step::ConfirmForceBranchDelete => self.render_confirm_force_branch_delete(frame),
+            Step::Options => self.render_options(frame),
+            Step::Confirm => self.render_confirm(frame),
             Step::Notice => self.render_notice(frame),
             Step::Success => self.render_success(frame),
             Step::Error => self.render_error(frame),
@@ -542,8 +461,9 @@ impl DeleteFlow {
             );
         }
 
-        let keys = Paragraph::new("Type: filter    Enter: select    Up/Down: move    Esc: back")
-            .block(Block::default().borders(Borders::ALL).title("Keys"));
+        let keys =
+            Paragraph::new("Type: filter    Enter: select    Up/Down or j/k: move    Esc: back")
+                .block(Block::default().borders(Borders::ALL).title("Keys"));
         frame.render_widget(keys, footer);
     }
 
@@ -563,8 +483,8 @@ impl DeleteFlow {
         frame.set_cursor_position((area.x + 1 + relative as u16, area.y + 1));
     }
 
-    fn render_confirm_delete(&self, frame: &mut ratatui::Frame<'_>) {
-        let area = centered_rect(70, 35, frame.area());
+    fn render_options(&self, frame: &mut ratatui::Frame<'_>) {
+        let area = centered_rect(78, 56, frame.area());
         frame.render_widget(Clear, area);
 
         let target = self
@@ -572,21 +492,55 @@ impl DeleteFlow {
             .as_ref()
             .map(|value| value.name.as_str())
             .unwrap_or("UNCONFIRMED");
-        let selection = if self.confirm_yes_selected {
-            "Yes"
-        } else {
-            "No"
-        };
-        let text = format!(
-            "Delete worktree '{target}'?\n\nSelection: {selection}\n\nLeft/Right: choose    Enter: continue    Esc: back"
-        );
+        let session_running = self
+            .target
+            .as_ref()
+            .map(|value| value.session_running)
+            .unwrap_or(false);
+
+        let rows = [
+            (
+                "Kill tmux session",
+                if session_running {
+                    if self.options.kill_tmux_session {
+                        "Yes"
+                    } else {
+                        "No"
+                    }
+                } else {
+                    "N/A (not running)"
+                },
+            ),
+            (
+                "Delete branch",
+                if self.options.delete_branch {
+                    "Yes"
+                } else {
+                    "No"
+                },
+            ),
+        ];
+
+        let mut body = String::new();
+        body.push_str(&format!("Delete options for '{target}':\n\n"));
+        for (index, (label, value)) in rows.iter().enumerate() {
+            let marker = if self.option_selected == index {
+                ">>"
+            } else {
+                "  "
+            };
+            body.push_str(&format!("{marker} {label}: {value}\n"));
+        }
+        body.push_str("\nLeft/Right or h/l: set No/Yes    Space: toggle\n");
+        body.push_str("Up/Down or j/k: move option    Enter: continue    Esc: back");
+
         let widget =
-            Paragraph::new(text).block(Block::default().borders(Borders::ALL).title("Delete"));
+            Paragraph::new(body).block(Block::default().borders(Borders::ALL).title("Delete"));
         frame.render_widget(widget, area);
     }
 
-    fn render_confirm_kill_session(&self, frame: &mut ratatui::Frame<'_>) {
-        let area = centered_rect(70, 35, frame.area());
+    fn render_confirm(&self, frame: &mut ratatui::Frame<'_>) {
+        let area = centered_rect(78, 48, frame.area());
         frame.render_widget(Clear, area);
 
         let target = self
@@ -594,55 +548,24 @@ impl DeleteFlow {
             .as_ref()
             .map(|value| value.name.as_str())
             .unwrap_or("UNCONFIRMED");
-        let selection = if self.kill_yes_selected { "Yes" } else { "No" };
-        let text = format!(
-            "Kill running tmux session for '{target}'?\n\nSelection: {selection}\n\nLeft/Right: choose    Enter: continue    Esc: back"
-        );
-        let widget =
-            Paragraph::new(text).block(Block::default().borders(Borders::ALL).title("Delete"));
-        frame.render_widget(widget, area);
-    }
-
-    fn render_confirm_delete_branch(&self, frame: &mut ratatui::Frame<'_>) {
-        let area = centered_rect(70, 35, frame.area());
-        frame.render_widget(Clear, area);
-
-        let target = self
-            .target
-            .as_ref()
-            .map(|value| value.name.as_str())
-            .unwrap_or("UNCONFIRMED");
-        let selection = if self.delete_branch_yes_selected {
+        let session_text = if self.options.kill_tmux_session {
             "Yes"
         } else {
             "No"
         };
-        let text = format!(
-            "Delete branch '{target}' as part of cleanup?\n\nSelection: {selection}\n\nLeft/Right: choose    Enter: continue    Esc: back"
-        );
-        let widget =
-            Paragraph::new(text).block(Block::default().borders(Borders::ALL).title("Delete"));
-        frame.render_widget(widget, area);
-    }
-
-    fn render_confirm_force_branch_delete(&self, frame: &mut ratatui::Frame<'_>) {
-        let area = centered_rect(75, 40, frame.area());
-        frame.render_widget(Clear, area);
-
-        let branch = self
-            .pending_branch_for_force
-            .as_deref()
-            .unwrap_or("UNCONFIRMED");
-        let selection = if self.force_delete_yes_selected {
+        let delete_branch_text = if self.options.delete_branch {
             "Yes"
         } else {
             "No"
         };
+        let selection = if self.confirm_execute { "Yes" } else { "No" };
+
         let text = format!(
-            "Branch '{branch}' is not fully merged.\nForce delete with -D?\n\nSelection: {selection}\n\nLeft/Right: choose    Enter: continue    Esc: keep branch"
+            "Confirm delete for '{target}':\n\nKill tmux session: {session_text}\nDelete branch: {delete_branch_text}\n\nExecute now? {selection}\n\nLeft/Right or h/l: choose No/Yes    y/n: choose    Enter: confirm    Esc: back"
         );
+
         let widget =
-            Paragraph::new(text).block(Block::default().borders(Borders::ALL).title("Delete"));
+            Paragraph::new(text).block(Block::default().borders(Borders::ALL).title("Confirm"));
         frame.render_widget(widget, area);
     }
 
@@ -690,19 +613,18 @@ mod tests {
 
     use anyhow::Result;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-    use seshmux_app::{DeleteError, DeleteRequest, DeleteResult, ListResult, WorktreeRow};
+    use seshmux_app::{DeleteRequest, DeleteResult, ListResult, WorktreeRow};
 
     use super::{DeleteFlow, DeleteFlowOps, FlowSignal, Step};
 
     struct FakeOps {
         rows: Vec<WorktreeRow>,
         delete_calls: RefCell<Vec<DeleteRequest>>,
-        force_calls: RefCell<Vec<String>>,
-        require_force: bool,
+        branch_not_merged: bool,
     }
 
     impl FakeOps {
-        fn new(session_running: bool, require_force: bool) -> Self {
+        fn new(session_running: bool, branch_not_merged: bool) -> Self {
             Self {
                 rows: vec![WorktreeRow {
                     name: "w1".to_string(),
@@ -713,8 +635,7 @@ mod tests {
                     session_running,
                 }],
                 delete_calls: RefCell::new(Vec::new()),
-                force_calls: RefCell::new(Vec::new()),
-                require_force,
+                branch_not_merged,
             }
         }
     }
@@ -729,25 +650,19 @@ mod tests {
 
         fn delete_worktree(&self, request: DeleteRequest) -> Result<DeleteResult> {
             self.delete_calls.borrow_mut().push(request.clone());
-            if self.require_force && request.delete_branch {
-                return Err(DeleteError::BranchRequiresForce {
-                    branch: "w1".to_string(),
-                }
-                .into());
-            }
+            let branch_deleted = if request.delete_branch {
+                !self.branch_not_merged
+            } else {
+                false
+            };
 
             Ok(DeleteResult {
                 worktree_name: request.worktree_name,
                 worktree_path: PathBuf::from("/tmp/repo/worktrees/w1"),
                 session_name: "repo/w1".to_string(),
                 branch_name: "w1".to_string(),
-                branch_deleted: request.delete_branch,
+                branch_deleted,
             })
-        }
-
-        fn force_delete_branch(&self, _cwd: &Path, branch_name: &str) -> Result<()> {
-            self.force_calls.borrow_mut().push(branch_name.to_string());
-            Ok(())
         }
     }
 
@@ -770,76 +685,57 @@ mod tests {
     }
 
     #[test]
-    fn delete_flow_passes_kill_and_branch_choices_to_usecase() {
+    fn options_are_collected_and_passed_to_delete_request() {
         let ops = FakeOps::new(true, false);
         let mut flow = DeleteFlow::new(&ops, Path::new("/tmp/repo")).expect("flow");
 
-        flow.on_key(key(KeyCode::Enter), &ops).expect("select");
-        assert_eq!(flow.step, Step::ConfirmDelete);
+        apply_keys(
+            &mut flow,
+            &ops,
+            &[
+                KeyCode::Enter,
+                KeyCode::Right,
+                KeyCode::Down,
+                KeyCode::Right,
+                KeyCode::Enter,
+                KeyCode::Right,
+                KeyCode::Enter,
+            ],
+        );
 
-        flow.on_key(key(KeyCode::Left), &ops).expect("confirm yes");
-        flow.on_key(key(KeyCode::Enter), &ops).expect("confirm");
-        assert_eq!(flow.step, Step::ConfirmKillSession);
-
-        flow.on_key(key(KeyCode::Left), &ops).expect("kill yes");
-        flow.on_key(key(KeyCode::Enter), &ops).expect("continue");
-        assert_eq!(flow.step, Step::ConfirmDeleteBranch);
-
-        flow.on_key(key(KeyCode::Right), &ops)
-            .expect("branch delete no");
-        flow.on_key(key(KeyCode::Enter), &ops).expect("execute");
         assert_eq!(flow.step, Step::Success);
 
         let calls = ops.delete_calls.borrow();
         assert_eq!(calls.len(), 1);
         assert!(calls[0].kill_tmux_session);
-        assert!(!calls[0].delete_branch);
+        assert!(calls[0].delete_branch);
     }
 
     #[test]
-    fn branch_requires_force_path_calls_force_delete_when_confirmed() {
+    fn branch_not_merged_still_returns_success() {
         let ops = FakeOps::new(false, true);
         let mut flow = DeleteFlow::new(&ops, Path::new("/tmp/repo")).expect("flow");
 
-        flow.on_key(key(KeyCode::Enter), &ops).expect("select");
-        flow.on_key(key(KeyCode::Left), &ops).expect("confirm yes");
-        flow.on_key(key(KeyCode::Enter), &ops).expect("continue");
-        assert_eq!(flow.step, Step::ConfirmDeleteBranch);
+        apply_keys(
+            &mut flow,
+            &ops,
+            &[
+                KeyCode::Enter,
+                KeyCode::Down,
+                KeyCode::Right,
+                KeyCode::Enter,
+                KeyCode::Right,
+                KeyCode::Enter,
+            ],
+        );
 
-        flow.on_key(key(KeyCode::Left), &ops).expect("branch yes");
-        flow.on_key(key(KeyCode::Enter), &ops).expect("execute");
-        assert_eq!(flow.step, Step::ConfirmForceBranchDelete);
-
-        flow.on_key(key(KeyCode::Left), &ops).expect("force yes");
-        flow.on_key(key(KeyCode::Enter), &ops)
-            .expect("force execute");
         assert_eq!(flow.step, Step::Success);
-
-        let force_calls = ops.force_calls.borrow();
-        assert_eq!(force_calls.as_slice(), &["w1".to_string()]);
-    }
-
-    #[test]
-    fn force_delete_prompt_esc_keeps_branch_even_when_yes_selected() {
-        let ops = FakeOps::new(false, true);
-        let mut flow = DeleteFlow::new(&ops, Path::new("/tmp/repo")).expect("flow");
-
-        flow.on_key(key(KeyCode::Enter), &ops).expect("select");
-        flow.on_key(key(KeyCode::Left), &ops).expect("confirm yes");
-        flow.on_key(key(KeyCode::Enter), &ops).expect("continue");
-        assert_eq!(flow.step, Step::ConfirmDeleteBranch);
-
-        flow.on_key(key(KeyCode::Left), &ops).expect("branch yes");
-        flow.on_key(key(KeyCode::Enter), &ops).expect("execute");
-        assert_eq!(flow.step, Step::ConfirmForceBranchDelete);
-
-        flow.on_key(key(KeyCode::Left), &ops).expect("force yes");
-        flow.on_key(key(KeyCode::Esc), &ops)
-            .expect("esc keeps branch");
-        assert_eq!(flow.step, Step::Success);
-
-        let force_calls = ops.force_calls.borrow();
-        assert!(force_calls.is_empty());
+        assert!(
+            flow.success_message
+                .as_deref()
+                .unwrap_or("")
+                .contains("kept (not fully merged)")
+        );
     }
 
     #[test]
@@ -848,11 +744,12 @@ mod tests {
         let mut flow = DeleteFlow::new(&ops, Path::new("/tmp/repo")).expect("flow");
 
         flow.on_key(key(KeyCode::Enter), &ops).expect("select");
-        assert_eq!(flow.step, Step::ConfirmDelete);
+        assert_eq!(flow.step, Step::Options);
 
-        flow.on_key(key(KeyCode::Char('n')), &ops).expect("set no");
-        flow.on_key(key(KeyCode::Enter), &ops)
-            .expect("confirm default no");
+        flow.on_key(key(KeyCode::Enter), &ops).expect("go confirm");
+        assert_eq!(flow.step, Step::Confirm);
+
+        flow.on_key(key(KeyCode::Enter), &ops).expect("confirm no");
         assert_eq!(flow.step, Step::Notice);
 
         flow.on_key(key(KeyCode::Enter), &ops)
@@ -864,45 +761,20 @@ mod tests {
     }
 
     #[test]
-    fn delete_confirm_defaults_to_yes_and_executes() {
+    fn option_screen_supports_h_and_l_keys() {
         let ops = FakeOps::new(false, false);
         let mut flow = DeleteFlow::new(&ops, Path::new("/tmp/repo")).expect("flow");
 
         flow.on_key(key(KeyCode::Enter), &ops).expect("select");
-        assert_eq!(flow.step, Step::ConfirmDelete);
+        assert_eq!(flow.step, Step::Options);
 
-        flow.on_key(key(KeyCode::Enter), &ops)
-            .expect("confirm default yes");
-        assert_eq!(flow.step, Step::ConfirmDeleteBranch);
+        flow.on_key(key(KeyCode::Down), &ops)
+            .expect("delete branch option");
+        flow.on_key(key(KeyCode::Char('l')), &ops).expect("set yes");
+        assert!(flow.options.delete_branch);
 
-        flow.on_key(key(KeyCode::Enter), &ops).expect("execute");
-        assert_eq!(flow.step, Step::Success);
-
-        let calls = ops.delete_calls.borrow();
-        assert_eq!(calls.len(), 1);
-    }
-
-    #[test]
-    fn enter_and_escape_navigation_is_deterministic_before_delete_executes() {
-        let ops = FakeOps::new(false, false);
-        let mut flow = DeleteFlow::new(&ops, Path::new("/tmp/repo")).expect("flow");
-
-        apply_keys(
-            &mut flow,
-            &ops,
-            &[
-                KeyCode::Enter,
-                KeyCode::Esc,
-                KeyCode::Enter,
-                KeyCode::Enter,
-                KeyCode::Esc,
-                KeyCode::Esc,
-            ],
-        );
-
-        assert_eq!(flow.step, Step::SelectWorktree);
-        let calls = ops.delete_calls.borrow();
-        assert!(calls.is_empty());
+        flow.on_key(key(KeyCode::Char('h')), &ops).expect("set no");
+        assert!(!flow.options.delete_branch);
     }
 
     #[test]
@@ -930,7 +802,14 @@ mod tests {
         apply_keys(
             &mut flow,
             &ops,
-            &[KeyCode::Enter, KeyCode::Enter, KeyCode::Enter],
+            &[
+                KeyCode::Enter,
+                KeyCode::Down,
+                KeyCode::Right,
+                KeyCode::Enter,
+                KeyCode::Right,
+                KeyCode::Enter,
+            ],
         );
         assert_eq!(flow.step, Step::Success);
 

@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use anyhow::anyhow;
-use seshmux_app::{App, AttachError, AttachRequest, DeleteError, DeleteRequest};
+use seshmux_app::{App, AttachError, AttachRequest, DeleteRequest};
 use seshmux_core::command_runner::{CommandOutput, CommandRunner};
 use seshmux_core::registry::{RegistryEntry, insert_unique_entry, load_registry};
 
@@ -277,7 +277,7 @@ fn delete_with_all_options_kills_session_removes_worktree_and_branch() {
 }
 
 #[test]
-fn delete_handles_not_fully_merged_branch_with_force_follow_up() {
+fn delete_keeps_branch_when_not_fully_merged() {
     let temp = tempfile::tempdir().expect("temp dir");
     let repo_root = temp.path().join("repo");
     fs::create_dir_all(repo_root.join("worktrees")).expect("worktrees");
@@ -288,28 +288,20 @@ fn delete_handles_not_fully_merged_branch_with_force_follow_up() {
             output(&format!("{}\n", repo_root.display()), "", 0),
             output("", "", 0),
             output("", "error: the branch 'w1' is not fully merged.", 1),
-            output(&format!("{}\n", repo_root.display()), "", 0),
-            output("", "", 0),
         ],
         Vec::new(),
     );
 
     let app = App::new(&runner);
-    let error = app
+    let result = app
         .delete(DeleteRequest {
             cwd: repo_root.clone(),
             worktree_name: "w1".to_string(),
             kill_tmux_session: false,
             delete_branch: true,
         })
-        .expect_err("branch should require force");
+        .expect("delete should still succeed");
 
-    let typed = error
-        .downcast_ref::<DeleteError>()
-        .expect("typed delete error");
-    assert!(matches!(typed, DeleteError::BranchRequiresForce { .. }));
+    assert!(!result.branch_deleted);
     assert!(load_registry(&repo_root).expect("registry load").is_empty());
-
-    app.force_delete_branch(&repo_root, "w1")
-        .expect("force delete should pass");
 }

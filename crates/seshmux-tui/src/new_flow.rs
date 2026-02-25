@@ -95,6 +95,7 @@ struct ExtrasState {
     nodes: BTreeMap<String, ExtraNode>,
     roots: Vec<String>,
     checked: HashSet<String>,
+    collapsed: HashSet<String>,
     visible: Vec<VisibleRow>,
     cursor: usize,
     filter: Input,
@@ -129,6 +130,7 @@ impl ExtrasState {
             nodes,
             roots: roots.into_iter().collect(),
             checked: HashSet::new(),
+            collapsed: HashSet::new(),
             visible: Vec::new(),
             cursor: 0,
             filter: Input::default(),
@@ -165,9 +167,13 @@ impl ExtrasState {
             return;
         };
         let children = node.children.clone();
+        let filtering = !self.filter.value().trim().is_empty();
+        let open = filtering || !self.collapsed.contains(key);
 
-        for child in &children {
-            self.push_visible(child);
+        if open {
+            for child in &children {
+                self.push_visible(child);
+            }
         }
     }
 
@@ -208,6 +214,28 @@ impl ExtrasState {
         let key = row.key.clone();
         let should_select = !self.checked.contains(&key);
         self.set_recursive_checked(&key, should_select);
+    }
+
+    fn toggle_fold_current(&mut self) {
+        let Some(row) = self.visible.get(self.cursor) else {
+            return;
+        };
+        let key = row.key.clone();
+        let is_dir = self
+            .nodes
+            .get(&key)
+            .map(|node| node.is_dir)
+            .unwrap_or(false);
+        if !is_dir {
+            return;
+        }
+
+        if self.collapsed.contains(&key) {
+            self.collapsed.remove(&key);
+        } else {
+            self.collapsed.insert(key);
+        }
+        self.refresh_visible();
     }
 
     fn set_recursive_checked(&mut self, key: &str, value: bool) {
@@ -385,13 +413,14 @@ impl ExtrasState {
 
     fn tree_state(&self) -> TreeState<String> {
         let mut state = TreeState::default();
+        let filtering = !self.filter.value().trim().is_empty();
         for row in &self.visible {
             let is_dir = self
                 .nodes
                 .get(&row.key)
                 .map(|node| node.is_dir)
                 .unwrap_or(false);
-            if is_dir {
+            if is_dir && (filtering || !self.collapsed.contains(&row.key)) {
                 state.open(identifier_path_for_key(&row.key));
             }
         }
@@ -657,12 +686,12 @@ impl NewFlow {
     fn on_key_gitignore(&mut self, key: KeyEvent) -> Result<FlowSignal> {
         match key.code {
             KeyCode::Esc => Ok(FlowSignal::Exit(UiExit::BackAtRoot)),
-            KeyCode::Left | KeyCode::Up => {
-                self.gitignore_yes_selected = true;
+            KeyCode::Left | KeyCode::Char('h') | KeyCode::Char('n') => {
+                self.gitignore_yes_selected = false;
                 Ok(FlowSignal::Continue)
             }
-            KeyCode::Right | KeyCode::Down => {
-                self.gitignore_yes_selected = false;
+            KeyCode::Right | KeyCode::Char('l') | KeyCode::Char('y') => {
+                self.gitignore_yes_selected = true;
                 Ok(FlowSignal::Continue)
             }
             KeyCode::Enter => {
@@ -712,11 +741,11 @@ impl NewFlow {
                 self.step = Step::NameInput;
                 Ok(FlowSignal::Continue)
             }
-            KeyCode::Up => {
+            KeyCode::Up | KeyCode::Char('k') => {
                 self.start_mode_selected = self.start_mode_selected.saturating_sub(1);
                 Ok(FlowSignal::Continue)
             }
-            KeyCode::Down => {
+            KeyCode::Down | KeyCode::Char('j') => {
                 if self.start_mode_selected < 2 {
                     self.start_mode_selected += 1;
                 }
@@ -756,11 +785,11 @@ impl NewFlow {
             KeyCode::Esc => {
                 self.step = Step::StartPointMode;
             }
-            KeyCode::Up => {
+            KeyCode::Up | KeyCode::Char('k') => {
                 picker.selected = picker.selected.saturating_sub(1);
                 self.branch_picker = Some(picker);
             }
-            KeyCode::Down => {
+            KeyCode::Down | KeyCode::Char('j') => {
                 if picker.selected + 1 < total_rows {
                     picker.selected += 1;
                 }
@@ -828,11 +857,11 @@ impl NewFlow {
             KeyCode::Esc => {
                 self.step = Step::StartPointMode;
             }
-            KeyCode::Up => {
+            KeyCode::Up | KeyCode::Char('k') => {
                 picker.selected = picker.selected.saturating_sub(1);
                 self.commit_picker = Some(picker);
             }
-            KeyCode::Down => {
+            KeyCode::Down | KeyCode::Char('j') => {
                 if picker.selected + 1 < total_rows {
                     picker.selected += 1;
                 }
@@ -910,10 +939,11 @@ impl NewFlow {
                     None => Step::StartPointMode,
                 };
             }
-            KeyCode::Up => self.extras.move_up(),
-            KeyCode::Down => self.extras.move_down(),
-            KeyCode::Enter | KeyCode::Char(' ') => self.extras.toggle_current(),
-            KeyCode::Tab => {
+            KeyCode::Up | KeyCode::Char('k') => self.extras.move_up(),
+            KeyCode::Down | KeyCode::Char('j') => self.extras.move_down(),
+            KeyCode::Char(' ') => self.extras.toggle_current(),
+            KeyCode::Tab => self.extras.toggle_fold_current(),
+            KeyCode::Enter => {
                 self.connect_yes_selected = true;
                 self.step = Step::ConnectNow;
             }
@@ -931,11 +961,11 @@ impl NewFlow {
             KeyCode::Esc => {
                 self.step = Step::ExtrasPicker;
             }
-            KeyCode::Left | KeyCode::Up => {
-                self.connect_yes_selected = true;
-            }
-            KeyCode::Right | KeyCode::Down => {
+            KeyCode::Left | KeyCode::Char('h') | KeyCode::Char('n') => {
                 self.connect_yes_selected = false;
+            }
+            KeyCode::Right | KeyCode::Char('l') | KeyCode::Char('y') => {
+                self.connect_yes_selected = true;
             }
             KeyCode::Enter => {
                 self.step = Step::Review;
@@ -1040,14 +1070,16 @@ impl NewFlow {
             .areas(area);
 
         let prompt = Paragraph::new(format!(
-            "Add 'worktrees/' to this repo's .gitignore?\n\nSelection: {}\nUse Left/Right (or Up/Down), Enter to continue.",
+            "Add 'worktrees/' to this repo's .gitignore?\n\nSelection: {}\nUse Left/Right or h/l (y/n also works), Enter to continue.",
             if self.gitignore_yes_selected { "Yes" } else { "No" }
         ))
         .block(Block::default().borders(Borders::ALL).title("New: .gitignore"));
         frame.render_widget(prompt, body);
 
-        let keys = Paragraph::new("Esc: exit flow    Ctrl+C: cancel")
-            .block(Block::default().borders(Borders::ALL).title("Keys"));
+        let keys = Paragraph::new(
+            "Left/Right or h/l: choose    y/n: choose    Enter: continue    Esc: exit flow",
+        )
+        .block(Block::default().borders(Borders::ALL).title("Keys"));
         frame.render_widget(keys, footer);
     }
 
@@ -1123,7 +1155,7 @@ impl NewFlow {
         state.select(Some(self.start_mode_selected));
         frame.render_stateful_widget(list, body, &mut state);
 
-        let keys = Paragraph::new("Up/Down: move    Enter: select    Esc: back")
+        let keys = Paragraph::new("Up/Down or j/k: move    Enter: select    Esc: back")
             .block(Block::default().borders(Borders::ALL).title("Keys"));
         frame.render_widget(keys, footer);
     }
@@ -1169,7 +1201,7 @@ impl NewFlow {
         state.select(Some(picker.map(|value| value.selected).unwrap_or(0)));
         frame.render_stateful_widget(list, body, &mut state);
 
-        let keys = Paragraph::new("Enter: choose    Up/Down: move    Esc: back")
+        let keys = Paragraph::new("Enter: choose    Up/Down or j/k: move    Esc: back")
             .block(Block::default().borders(Borders::ALL).title("Keys"));
         frame.render_widget(keys, footer);
     }
@@ -1252,7 +1284,7 @@ impl NewFlow {
         state.select(Some(picker.map(|value| value.selected).unwrap_or(0)));
         frame.render_stateful_widget(list, body, &mut state);
 
-        let keys = Paragraph::new("Enter: choose    Up/Down: move    Esc: back")
+        let keys = Paragraph::new("Enter: choose    Up/Down or j/k: move    Esc: back")
             .block(Block::default().borders(Borders::ALL).title("Keys"));
         frame.render_widget(keys, footer);
     }
@@ -1351,7 +1383,7 @@ impl NewFlow {
         let key_label = if self.extras.editing_filter {
             "Type: filter    Enter/Esc: finish filter edit"
         } else {
-            "Up/Down: move    Enter/Space: toggle    a: all    n: none    /: filter    Tab: continue    Esc: back"
+            "Up/Down or j/k: move    Tab: fold/unfold    Space: toggle    Enter: continue    a: all    n: none    /: filter    Esc: back"
         };
         let keys =
             Paragraph::new(key_label).block(Block::default().borders(Borders::ALL).title("Keys"));
@@ -1380,9 +1412,10 @@ impl NewFlow {
         );
         frame.render_widget(paragraph, body);
 
-        let keys =
-            Paragraph::new("Left/Right (or Up/Down): choose    Enter: continue    Esc: back")
-                .block(Block::default().borders(Borders::ALL).title("Keys"));
+        let keys = Paragraph::new(
+            "Left/Right or h/l: choose    y/n: choose    Enter: continue    Esc: back",
+        )
+        .block(Block::default().borders(Borders::ALL).title("Keys"));
         frame.render_widget(keys, footer);
     }
 
@@ -1654,7 +1687,7 @@ mod tests {
             .expect("current mode");
 
         assert_eq!(flow.step, Step::ExtrasPicker);
-        flow.on_key(key(KeyCode::Enter), &ops)
+        flow.on_key(key(KeyCode::Char(' ')), &ops)
             .expect("toggle root dir");
         let before = flow.extras.selected_for_copy();
         assert!(before.iter().any(|path| path == &PathBuf::from("dir")));
@@ -1712,7 +1745,7 @@ mod tests {
     }
 
     #[test]
-    fn extras_enter_noops_when_filtered_view_is_empty() {
+    fn extras_space_noops_when_filtered_view_is_empty() {
         let temp = tempfile::tempdir().expect("temp dir");
         let repo_root = temp.path().join("repo");
         std::fs::create_dir_all(repo_root.join("dir/sub")).expect("dirs");
@@ -1742,9 +1775,39 @@ mod tests {
             .expect("finish filter");
         assert!(flow.extras.visible.is_empty());
 
-        flow.on_key(key(KeyCode::Enter), &ops)
-            .expect("enter on empty extras view");
+        flow.on_key(key(KeyCode::Char(' ')), &ops)
+            .expect("space on empty extras view");
         assert_eq!(flow.step, Step::ExtrasPicker);
+    }
+
+    #[test]
+    fn extras_tab_folds_directory_without_leaving_step() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let repo_root = temp.path().join("repo");
+        std::fs::create_dir_all(repo_root.join("dir/sub")).expect("dirs");
+        std::fs::write(repo_root.join("dir/sub/one.txt"), "one").expect("file one");
+
+        let mut ops = FakeOps::new(repo_root.clone());
+        ops.extras = vec![PathBuf::from("dir")];
+
+        let mut flow = NewFlow::new(&ops, &repo_root).expect("flow");
+        flow.on_key(key(KeyCode::Enter), &ops).expect("gitignore");
+        for character in "abc".chars() {
+            flow.on_key(key(KeyCode::Char(character)), &ops)
+                .expect("name");
+        }
+        flow.on_key(key(KeyCode::Enter), &ops).expect("name enter");
+        flow.on_key(key(KeyCode::Enter), &ops)
+            .expect("current mode");
+        assert_eq!(flow.step, Step::ExtrasPicker);
+
+        let before = flow.extras.visible.len();
+        flow.on_key(key(KeyCode::Tab), &ops)
+            .expect("fold current directory");
+        let after = flow.extras.visible.len();
+
+        assert_eq!(flow.step, Step::ExtrasPicker);
+        assert!(after < before);
     }
 
     #[test]
@@ -1763,9 +1826,9 @@ mod tests {
         flow.on_key(key(KeyCode::Enter), &ops).expect("name enter");
         flow.on_key(key(KeyCode::Enter), &ops)
             .expect("start current");
-        flow.on_key(key(KeyCode::Tab), &ops)
+        flow.on_key(key(KeyCode::Enter), &ops)
             .expect("extras continue");
-        flow.on_key(key(KeyCode::Right), &ops).expect("connect no");
+        flow.on_key(key(KeyCode::Left), &ops).expect("connect no");
         flow.on_key(key(KeyCode::Enter), &ops).expect("review");
         flow.on_key(key(KeyCode::Enter), &ops).expect("execute");
 

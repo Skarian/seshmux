@@ -34,12 +34,6 @@ pub struct CommitRef {
     pub display: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BranchDeleteMode {
-    Safe,
-    Force,
-}
-
 #[derive(Debug, Error)]
 pub enum GitError {
     #[error("git command failed: git {command} (exit {status}) {stderr}")]
@@ -56,7 +50,7 @@ pub enum GitError {
         "repository has no commits yet; create an initial commit or choose a different start point"
     )]
     NoCommits,
-    #[error("branch '{branch}' is not fully merged; explicit force is required")]
+    #[error("branch '{branch}' is not fully merged; safe delete aborted")]
     BranchNotFullyMerged { branch: String },
 }
 
@@ -184,7 +178,6 @@ pub fn remove_worktree(
 pub fn delete_branch(
     repo_root: &Path,
     branch_name: &str,
-    mode: BranchDeleteMode,
     runner: &dyn CommandRunner,
 ) -> Result<(), GitError> {
     let branch = branch_name.trim();
@@ -192,25 +185,19 @@ pub fn delete_branch(
         return Err(GitError::Parse("branch name cannot be empty".to_string()));
     }
 
-    let flag = match mode {
-        BranchDeleteMode::Safe => "-d",
-        BranchDeleteMode::Force => "-D",
-    };
-
-    let output = run_git(runner, &["branch", flag, branch], Some(repo_root))?;
+    let output = run_git(runner, &["branch", "-d", branch], Some(repo_root))?;
     if output.status_code == 0 {
         return Ok(());
     }
 
-    if matches!(mode, BranchDeleteMode::Safe) && looks_like_branch_not_fully_merged(&output.stderr)
-    {
+    if looks_like_branch_not_fully_merged(&output.stderr) {
         return Err(GitError::BranchNotFullyMerged {
             branch: branch.to_string(),
         });
     }
 
     Err(GitError::CommandFailed {
-        command: format!("branch {flag} {branch}"),
+        command: format!("branch -d {branch}"),
         status: output.status_code,
         stderr: output.stderr.trim().to_string(),
     })
@@ -538,21 +525,9 @@ mod tests {
             1,
         )]);
 
-        let error = delete_branch(Path::new("."), "feature-1", BranchDeleteMode::Safe, &runner)
-            .expect_err("branch should require force");
+        let error = delete_branch(Path::new("."), "feature-1", &runner)
+            .expect_err("branch should report not fully merged");
 
         assert!(matches!(error, GitError::BranchNotFullyMerged { .. }));
-    }
-
-    #[test]
-    fn delete_branch_force_succeeds() {
-        let runner = QueueRunner::new(vec![output("", "", 0)]);
-        let result = delete_branch(
-            Path::new("."),
-            "feature-1",
-            BranchDeleteMode::Force,
-            &runner,
-        );
-        assert!(result.is_ok());
     }
 }
