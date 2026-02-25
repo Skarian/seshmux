@@ -12,7 +12,8 @@ path = "src/main.rs"
 anyhow.workspace = true
 clap.workspace = true
 comfy-table.workspace = true
-inquire.workspace = true
+seshmux-app = { path = "../seshmux-app" }
+seshmux-tui = { path = "../seshmux-tui" }
 seshmux-core = { path = "../seshmux-core" }
 
 [dev-dependencies]

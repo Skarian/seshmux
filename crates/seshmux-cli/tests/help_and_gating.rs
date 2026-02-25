@@ -36,17 +36,24 @@ fn root_help_runs_without_config() {
         .arg("--help")
         .assert()
         .success()
-        .stdout(predicate::str::contains("Usage: seshmux"));
+        .stdout(predicate::str::contains("Usage: seshmux"))
+        .stdout(predicate::str::contains("doctor"))
+        .stdout(predicate::str::contains("new").not())
+        .stdout(predicate::str::contains("list").not())
+        .stdout(predicate::str::contains("attach").not())
+        .stdout(predicate::str::contains("delete").not());
 }
 
 #[test]
-fn subcommand_help_runs_without_config() {
+fn doctor_help_runs_without_config() {
     let (mut command, _temp_home) = new_command_with_temp_home();
     command
-        .args(["list", "--help"])
+        .args(["doctor", "--help"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("List registered worktrees"));
+        .stdout(predicate::str::contains(
+            "Run environment and configuration checks",
+        ));
 }
 
 #[test]
@@ -61,28 +68,48 @@ fn doctor_runs_without_config() {
 }
 
 #[test]
-fn runtime_commands_are_gated_without_config() {
+fn legacy_subcommands_are_rejected() {
     for subcommand in ["new", "list", "attach", "delete"] {
         let (mut command, _temp_home) = new_command_with_temp_home();
         command
             .arg(subcommand)
             .assert()
             .failure()
-            .stderr(predicate::str::contains("missing config at"))
-            .stderr(predicate::str::contains(".config/seshmux/config.toml"))
-            .stderr(predicate::str::contains("README.md"));
+            .stderr(predicate::str::contains("unrecognized subcommand"));
     }
 }
 
 #[test]
-fn runtime_command_reaches_stub_with_valid_config() {
+fn root_command_is_gated_without_config() {
+    let (mut command, _temp_home) = new_command_with_temp_home();
+    command
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("missing config at"))
+        .stderr(predicate::str::contains(".config/seshmux/config.toml"))
+        .stderr(predicate::str::contains("README.md"));
+}
+
+#[test]
+fn root_command_runs_when_config_exists() {
     let (mut command, temp_home) = new_command_with_temp_home();
     write_valid_config(temp_home.path());
 
     command
-        .arg("list")
+        .env("SESHMUX_TUI_TEST_EXIT", "completed")
         .assert()
-        .failure()
-        .stderr(predicate::str::contains("list is not implemented in this milestone"))
-        .stderr(predicate::str::contains("missing config at").not());
+        .success()
+        .stderr(predicate::str::is_empty());
+}
+
+#[test]
+fn root_command_prints_cancel_message() {
+    let (mut command, temp_home) = new_command_with_temp_home();
+    write_valid_config(temp_home.path());
+
+    command
+        .env("SESHMUX_TUI_TEST_EXIT", "canceled")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Canceled."));
 }

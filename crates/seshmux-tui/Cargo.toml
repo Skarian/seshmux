@@ -1,0 +1,10 @@
+[package]
+name = "seshmux-tui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+crossterm.workspace = true
+seshmux-app = { path = "../seshmux-app" }

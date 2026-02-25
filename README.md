@@ -1,10 +1,10 @@
 # seshmux
 
-`seshmux` is an interactive Rust CLI for managing git worktrees paired with tmux sessions.
+`seshmux` is a TUI-first Rust tool for managing git worktrees paired with tmux sessions.
 
 ## Configuration
 
-`seshmux` requires a config file before runtime commands (`new`, `list`, `attach`, `delete`) will run.
+`seshmux` requires a config file before the interactive runtime (`seshmux`) will run.
 
 Create `~/.config/seshmux/config.toml`:
 
@@ -40,9 +40,7 @@ Launch-mode rules:
 
 ## Commands
 
+- `seshmux`
 - `seshmux doctor`
-- `seshmux new`
-- `seshmux list`
-- `seshmux attach`
-- `seshmux delete`
 - `seshmux --help`
+- `seshmux doctor --help`
