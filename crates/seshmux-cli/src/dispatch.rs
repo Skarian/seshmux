@@ -17,6 +17,7 @@ pub fn run_with_deps(cli: Cli, app: &App<'_>, cwd: &Path) -> Result<()> {
 
 fn run_root_command(app: &App<'_>, cwd: &Path) -> Result<()> {
     app.ensure_config_ready()?;
+    app.ensure_runtime_repo_ready(cwd)?;
 
     if matches!(seshmux_tui::run_root(app, cwd)?, UiExit::Canceled) {
         println!("Canceled.");

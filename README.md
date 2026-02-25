@@ -2,6 +2,11 @@
 
 `seshmux` is a TUI-first Rust tool for managing git worktrees paired with tmux sessions.
 
+Runtime expectations:
+
+- Run `seshmux` from inside a git repository.
+- The repository must have at least one commit before runtime flows start.
+
 ## Configuration
 
 `seshmux` requires a config file before the interactive runtime (`seshmux`) will run.

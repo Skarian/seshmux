@@ -2,6 +2,7 @@ use assert_cmd::Command;
 use predicates::prelude::*;
 use std::fs;
 use std::path::Path;
+use std::process::Command as StdCommand;
 
 fn new_command_with_temp_home() -> (Command, tempfile::TempDir) {
     let temp_home = tempfile::tempdir().expect("temp home");
@@ -27,6 +28,55 @@ args = []
 "#,
     )
     .expect("write config");
+}
+
+fn init_git_repo(path: &Path) {
+    fs::create_dir_all(path).expect("create repo dir");
+    let output = StdCommand::new("git")
+        .arg("init")
+        .current_dir(path)
+        .output()
+        .expect("git init");
+    assert!(
+        output.status.success(),
+        "git init failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn init_git_repo_with_commit(path: &Path) {
+    init_git_repo(path);
+    fs::write(path.join("README.md"), "hello\n").expect("write readme");
+
+    let add_output = StdCommand::new("git")
+        .args(["add", "."])
+        .current_dir(path)
+        .output()
+        .expect("git add");
+    assert!(
+        add_output.status.success(),
+        "git add failed: {}",
+        String::from_utf8_lossy(&add_output.stderr)
+    );
+
+    let commit_output = StdCommand::new("git")
+        .args([
+            "-c",
+            "user.name=seshmux-test",
+            "-c",
+            "user.email=seshmux-test@example.com",
+            "commit",
+            "-m",
+            "initial",
+        ])
+        .current_dir(path)
+        .output()
+        .expect("git commit");
+    assert!(
+        commit_output.status.success(),
+        "git commit failed: {}",
+        String::from_utf8_lossy(&commit_output.stderr)
+    );
 }
 
 #[test]
@@ -94,8 +144,11 @@ fn root_command_is_gated_without_config() {
 fn root_command_runs_when_config_exists() {
     let (mut command, temp_home) = new_command_with_temp_home();
     write_valid_config(temp_home.path());
+    let repo_dir = temp_home.path().join("repo");
+    init_git_repo_with_commit(&repo_dir);
 
     command
+        .current_dir(&repo_dir)
         .env("SESHMUX_TUI_TEST_EXIT", "completed")
         .assert()
         .success()
@@ -106,10 +159,41 @@ fn root_command_runs_when_config_exists() {
 fn root_command_prints_cancel_message() {
     let (mut command, temp_home) = new_command_with_temp_home();
     write_valid_config(temp_home.path());
+    let repo_dir = temp_home.path().join("repo");
+    init_git_repo_with_commit(&repo_dir);
 
     command
+        .current_dir(&repo_dir)
         .env("SESHMUX_TUI_TEST_EXIT", "canceled")
         .assert()
         .success()
         .stdout(predicate::str::contains("Canceled."));
+}
+
+#[test]
+fn root_command_fails_outside_git_repo_before_tui() {
+    let (mut command, temp_home) = new_command_with_temp_home();
+    write_valid_config(temp_home.path());
+
+    command
+        .current_dir(temp_home.path())
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "failed to resolve git repository root",
+        ));
+}
+
+#[test]
+fn root_command_fails_in_repo_with_no_commits_before_tui() {
+    let (mut command, temp_home) = new_command_with_temp_home();
+    write_valid_config(temp_home.path());
+    let repo_dir = temp_home.path().join("empty-repo");
+    init_git_repo(&repo_dir);
+
+    command
+        .current_dir(&repo_dir)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("repository has no commits yet"));
 }

@@ -7,4 +7,9 @@ license.workspace = true
 [dependencies]
 anyhow.workspace = true
 crossterm.workspace = true
+ratatui.workspace = true
 seshmux-app = { path = "../seshmux-app" }
+seshmux-core = { path = "../seshmux-core" }
+
+[dev-dependencies]
+tempfile.workspace = true

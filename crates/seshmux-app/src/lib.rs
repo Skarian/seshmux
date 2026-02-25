@@ -2,6 +2,8 @@ mod new;
 
 pub use new::{NewPrepare, NewRequest, NewResult, NewStartPoint};
 
+use std::path::{Path, PathBuf};
+
 use anyhow::{Context, Result, anyhow, bail};
 use seshmux_core::command_runner::CommandRunner;
 use seshmux_core::config::{SeshmuxConfig, load_config, resolve_config_path};
@@ -36,5 +38,30 @@ impl<'a> App<'a> {
                 config_path.display()
             )
         })
+    }
+
+    pub fn ensure_runtime_repo_ready(&self, cwd: &Path) -> Result<PathBuf> {
+        let repo_root = seshmux_core::git::repo_root(cwd, self.runner).with_context(|| {
+            format!(
+                "failed to resolve git repository root from {}",
+                cwd.display()
+            )
+        })?;
+
+        let commits = seshmux_core::git::query_commits(&repo_root, "", 1, self.runner)
+            .with_context(|| {
+                format!(
+                    "failed to inspect commit history in {}",
+                    repo_root.display()
+                )
+            })?;
+
+        if commits.is_empty() {
+            bail!(
+                "repository has no commits yet; create an initial commit before starting seshmux"
+            );
+        }
+
+        Ok(repo_root)
     }
 }
