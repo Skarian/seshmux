@@ -1,0 +1,3 @@
+[submodule "references/ratatui"]
+	path = references/ratatui
+	url = https://github.com/ratatui/ratatui.git
