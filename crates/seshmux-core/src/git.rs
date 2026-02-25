@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 
 use thiserror::Error;
 
+use crate::command_adapter;
 use crate::command_runner::{CommandOutput, CommandRunner};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -175,6 +176,23 @@ pub fn remove_worktree(
     Ok(())
 }
 
+pub fn force_remove_worktree(
+    repo_root: &Path,
+    target_path: &Path,
+    runner: &dyn CommandRunner,
+) -> Result<(), GitError> {
+    let target = target_path
+        .to_str()
+        .ok_or_else(|| GitError::Parse("worktree path is not valid UTF-8".to_string()))?;
+
+    run_git_checked(
+        runner,
+        &["worktree", "remove", "--force", target],
+        Some(repo_root),
+    )?;
+    Ok(())
+}
+
 pub fn delete_branch(
     repo_root: &Path,
     branch_name: &str,
@@ -201,6 +219,20 @@ pub fn delete_branch(
         status: output.status_code,
         stderr: output.stderr.trim().to_string(),
     })
+}
+
+pub fn force_delete_branch(
+    repo_root: &Path,
+    branch_name: &str,
+    runner: &dyn CommandRunner,
+) -> Result<(), GitError> {
+    let branch = branch_name.trim();
+    if branch.is_empty() {
+        return Err(GitError::Parse("branch name cannot be empty".to_string()));
+    }
+
+    run_git_checked(runner, &["branch", "-D", branch], Some(repo_root))?;
+    Ok(())
 }
 
 pub fn query_branches(
@@ -347,8 +379,6 @@ fn parse_commit_lines(raw: &str) -> Result<Vec<CommitRef>, GitError> {
 fn looks_like_empty_history(stderr: &str) -> bool {
     let normalized = stderr.to_lowercase();
     normalized.contains("does not have any commits yet")
-        || normalized.contains("your current branch")
-            && normalized.contains("does not have any commits yet")
         || normalized.contains("fatal: ambiguous argument 'head'")
         || normalized.contains("unknown revision or path not in the working tree")
 }
@@ -364,16 +394,11 @@ fn run_git_checked(
     cwd: Option<&Path>,
 ) -> Result<CommandOutput, GitError> {
     let output = run_git(runner, args, cwd)?;
-
-    if output.status_code != 0 {
-        return Err(GitError::CommandFailed {
-            command: args.join(" "),
-            status: output.status_code,
-            stderr: output.stderr.trim().to_string(),
-        });
-    }
-
-    Ok(output)
+    command_adapter::ensure_success(args, output).map_err(|failure| GitError::CommandFailed {
+        command: failure.command,
+        status: failure.status,
+        stderr: failure.stderr,
+    })
 }
 
 fn run_git(
@@ -381,9 +406,7 @@ fn run_git(
     args: &[&str],
     cwd: Option<&Path>,
 ) -> Result<CommandOutput, GitError> {
-    runner
-        .run("git", args, cwd)
-        .map_err(|error| GitError::Execute(error.to_string()))
+    command_adapter::run_program(runner, "git", args, cwd).map_err(GitError::Execute)
 }
 
 #[cfg(test)]
@@ -529,5 +552,19 @@ mod tests {
             .expect_err("branch should report not fully merged");
 
         assert!(matches!(error, GitError::BranchNotFullyMerged { .. }));
+    }
+
+    #[test]
+    fn force_remove_worktree_uses_force_flag() {
+        let runner = QueueRunner::new(vec![output("", "", 0)]);
+        let result = force_remove_worktree(Path::new("."), Path::new("./worktrees/w1"), &runner);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn force_delete_branch_uses_capital_d() {
+        let runner = QueueRunner::new(vec![output("", "", 0)]);
+        let result = force_delete_branch(Path::new("."), "feature-1", &runner);
+        assert!(result.is_ok());
     }
 }

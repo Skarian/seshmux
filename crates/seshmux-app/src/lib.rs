@@ -1,7 +1,10 @@
 mod attach;
+mod catalog;
 mod delete;
 mod list;
 mod new;
+mod runtime;
+mod target;
 
 pub use attach::{AttachError, AttachRequest, AttachResult};
 pub use delete::{DeleteError, DeleteRequest, DeleteResult};
@@ -47,12 +50,7 @@ impl<'a> App<'a> {
     }
 
     pub fn ensure_runtime_repo_ready(&self, cwd: &Path) -> Result<PathBuf> {
-        let repo_root = seshmux_core::git::repo_root(cwd, self.runner).with_context(|| {
-            format!(
-                "failed to resolve git repository root from {}",
-                cwd.display()
-            )
-        })?;
+        let repo_root = runtime::resolve_repo_root(self, cwd)?;
 
         let commits = seshmux_core::git::query_commits(&repo_root, "", 1, self.runner)
             .with_context(|| {

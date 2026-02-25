@@ -1,7 +1,10 @@
 mod attach_flow;
 mod delete_flow;
+mod keymap;
 mod list_flow;
 mod new_flow;
+mod theme;
+mod ui;
 
 use std::io::{Stdout, stdout};
 use std::path::Path;
@@ -20,9 +23,12 @@ use new_flow::NewScreen;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout};
-use ratatui::style::{Color, Modifier, Style};
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
+use ratatui::style::Color;
+use ratatui::widgets::{List, ListItem, ListState};
 use seshmux_app::App;
+
+use crate::ui::modal::render_error_modal;
+use crate::ui::text::{compact_hint, wrapped_paragraph};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UiExit {
@@ -117,21 +123,27 @@ impl RootScreen {
     }
 
     fn on_key(&mut self, key: KeyEvent) -> Option<RootMenuExit> {
-        match key.code {
-            KeyCode::Esc | KeyCode::Char('q') => Some(RootMenuExit::Exit),
-            KeyCode::Up | KeyCode::Char('k') => {
-                self.selected = self.selected.saturating_sub(1);
-                None
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                if self.selected + 1 < ROOT_ACTIONS.len() {
-                    self.selected += 1;
-                }
-                None
-            }
-            KeyCode::Enter => Some(RootMenuExit::Action(ROOT_ACTIONS[self.selected])),
-            _ => None,
+        if keymap::is_back(key) || keymap::is_quit(key) {
+            return Some(RootMenuExit::Exit);
         }
+
+        if keymap::is_up(key) {
+            self.selected = self.selected.saturating_sub(1);
+            return None;
+        }
+
+        if keymap::is_down(key) {
+            if self.selected + 1 < ROOT_ACTIONS.len() {
+                self.selected += 1;
+            }
+            return None;
+        }
+
+        if keymap::is_confirm(key) {
+            return Some(RootMenuExit::Action(ROOT_ACTIONS[self.selected]));
+        }
+
+        None
     }
 
     fn render(&self, frame: &mut ratatui::Frame<'_>, cwd: &Path) {
@@ -145,11 +157,11 @@ impl RootScreen {
             ])
             .areas(area);
 
-        let title = Paragraph::new(format!(
+        let title = wrapped_paragraph(format!(
             "seshmux\n{}\nSelect a workflow",
             cwd.to_string_lossy()
         ))
-        .block(Block::default().borders(Borders::ALL).title("Root"));
+        .block(theme::chrome("Root"));
         frame.render_widget(title, header);
 
         let items: Vec<ListItem<'_>> = ROOT_ACTIONS
@@ -157,20 +169,20 @@ impl RootScreen {
             .map(|action| ListItem::new(action.title()))
             .collect();
         let list = List::new(items)
-            .block(Block::default().borders(Borders::ALL).title("Actions"))
-            .highlight_style(
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            );
+            .block(theme::chrome("Actions"))
+            .highlight_style(theme::table_highlight(Color::Cyan));
 
         let mut state = ListState::default();
         state.select(Some(self.selected));
         frame.render_stateful_widget(list, body, &mut state);
 
-        let hints = Paragraph::new("Enter: select    Up/Down or j/k: move    Esc/q: exit")
-            .block(Block::default().borders(Borders::ALL).title("Keys"));
+        let hints = wrapped_paragraph(compact_hint(
+            area.width,
+            "Enter: select    Up/Down or j/k: move    Esc/q: exit",
+            "Enter: select    j/k: move    Esc/q: exit",
+            "Enter: select | j/k: move | Esc/q: exit",
+        ))
+        .block(theme::key_block());
         frame.render_widget(hints, footer);
     }
 }
@@ -200,14 +212,21 @@ pub fn run_root(app: &App<'_>, cwd: &Path) -> Result<UiExit> {
 
     let mut session = TerminalSession::enter()?;
     let mut active = ActiveScreen::Root(RootScreen::new());
+    let mut global_error: Option<String> = None;
 
     loop {
-        session.draw(|frame| match &active {
-            ActiveScreen::Root(screen) => screen.render(frame, cwd),
-            ActiveScreen::New(screen) => screen.render(frame),
-            ActiveScreen::List(screen) => screen.render(frame),
-            ActiveScreen::Attach(screen) => screen.render(frame),
-            ActiveScreen::Delete(screen) => screen.render(frame),
+        session.draw(|frame| {
+            match &active {
+                ActiveScreen::Root(screen) => screen.render(frame, cwd),
+                ActiveScreen::New(screen) => screen.render(frame),
+                ActiveScreen::List(screen) => screen.render(frame),
+                ActiveScreen::Attach(screen) => screen.render(frame),
+                ActiveScreen::Delete(screen) => screen.render(frame),
+            }
+
+            if let Some(message) = global_error.as_deref() {
+                render_global_error(frame, message);
+            }
         })?;
 
         let event = event::read().context("failed to read terminal event")?;
@@ -224,32 +243,69 @@ pub fn run_root(app: &App<'_>, cwd: &Path) -> Result<UiExit> {
             return Ok(UiExit::Canceled);
         }
 
+        if global_error.is_some() {
+            if keymap::is_confirm(key) || keymap::is_back(key) {
+                global_error = None;
+            }
+            continue;
+        }
+
         let transition = match &mut active {
             ActiveScreen::Root(screen) => match screen.on_key(key) {
                 Some(RootMenuExit::Action(action)) => Some(Transition::Open(action)),
                 Some(RootMenuExit::Exit) => Some(Transition::Return(UiExit::Completed)),
                 None => None,
             },
-            ActiveScreen::New(screen) => screen.on_key(key, app)?.map(Transition::Return),
-            ActiveScreen::List(screen) => screen.on_key(key, app)?.map(Transition::Return),
-            ActiveScreen::Attach(screen) => screen.on_key(key, app)?.map(Transition::Return),
-            ActiveScreen::Delete(screen) => screen.on_key(key, app)?.map(Transition::Return),
+            ActiveScreen::New(screen) => match screen.on_key(key, app) {
+                Ok(value) => value.map(Transition::Return),
+                Err(error) => {
+                    global_error = Some(format!("{error:#}"));
+                    None
+                }
+            },
+            ActiveScreen::List(screen) => match screen.on_key(key, app) {
+                Ok(value) => value.map(Transition::Return),
+                Err(error) => {
+                    global_error = Some(format!("{error:#}"));
+                    None
+                }
+            },
+            ActiveScreen::Attach(screen) => match screen.on_key(key, app) {
+                Ok(value) => value.map(Transition::Return),
+                Err(error) => {
+                    global_error = Some(format!("{error:#}"));
+                    None
+                }
+            },
+            ActiveScreen::Delete(screen) => match screen.on_key(key, app) {
+                Ok(value) => value.map(Transition::Return),
+                Err(error) => {
+                    global_error = Some(format!("{error:#}"));
+                    None
+                }
+            },
         };
 
         if let Some(transition) = transition {
             match transition {
                 Transition::Open(action) => {
-                    active = match action {
-                        RootAction::New => ActiveScreen::New(Box::new(NewScreen::new(app, cwd)?)),
-                        RootAction::List => {
-                            ActiveScreen::List(Box::new(ListScreen::new(app, cwd)?))
-                        }
-                        RootAction::Attach => {
-                            ActiveScreen::Attach(Box::new(AttachScreen::new(app, cwd)?))
-                        }
-                        RootAction::Delete => {
-                            ActiveScreen::Delete(Box::new(DeleteScreen::new(app, cwd)?))
-                        }
+                    match action {
+                        RootAction::New => match NewScreen::new(app, cwd) {
+                            Ok(screen) => active = ActiveScreen::New(Box::new(screen)),
+                            Err(error) => global_error = Some(format!("{error:#}")),
+                        },
+                        RootAction::List => match ListScreen::new(app, cwd) {
+                            Ok(screen) => active = ActiveScreen::List(Box::new(screen)),
+                            Err(error) => global_error = Some(format!("{error:#}")),
+                        },
+                        RootAction::Attach => match AttachScreen::new(app, cwd) {
+                            Ok(screen) => active = ActiveScreen::Attach(Box::new(screen)),
+                            Err(error) => global_error = Some(format!("{error:#}")),
+                        },
+                        RootAction::Delete => match DeleteScreen::new(app, cwd) {
+                            Ok(screen) => active = ActiveScreen::Delete(Box::new(screen)),
+                            Err(error) => global_error = Some(format!("{error:#}")),
+                        },
                     };
                 }
                 Transition::Return(UiExit::Canceled) => return Ok(UiExit::Canceled),
@@ -260,6 +316,11 @@ pub fn run_root(app: &App<'_>, cwd: &Path) -> Result<UiExit> {
             }
         }
     }
+}
+
+fn render_global_error(frame: &mut ratatui::Frame<'_>, message: &str) {
+    let text = format!("Operation failed.\n\n{message}");
+    render_error_modal(frame, &text, 88, 72, "Enter/Esc to continue.");
 }
 
 pub(crate) fn centered_rect(

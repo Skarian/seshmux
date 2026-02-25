@@ -51,8 +51,8 @@ pub fn list_extra_candidates(
     let mut set = BTreeSet::new();
 
     for entry in untracked.into_iter().chain(ignored.into_iter()) {
-        validate_relative_path(&entry)?;
-        set.insert(entry);
+        let normalized = normalize_extra_relative_path(&entry)?;
+        set.insert(normalized);
     }
 
     Ok(set.into_iter().collect())
@@ -64,10 +64,10 @@ pub fn copy_selected_extras(
     selected: &[PathBuf],
 ) -> Result<(), ExtrasError> {
     for relative in selected {
-        validate_relative_path(relative)?;
+        let normalized = normalize_extra_relative_path(relative)?;
 
-        let source = repo_root.join(relative);
-        let target = target_root.join(relative);
+        let source = repo_root.join(&normalized);
+        let target = target_root.join(&normalized);
 
         if source.is_dir() {
             copy_directory_recursive(&source, &target)?;
@@ -92,6 +92,30 @@ pub fn copy_selected_extras(
     }
 
     Ok(())
+}
+
+pub fn normalize_extra_relative_path(path: &Path) -> Result<PathBuf, ExtrasError> {
+    if path.is_absolute() {
+        return Err(ExtrasError::InvalidPath(path.display().to_string()));
+    }
+
+    let mut clean = PathBuf::new();
+
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::Normal(value) => clean.push(value),
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(ExtrasError::InvalidPath(path.display().to_string()));
+            }
+        }
+    }
+
+    if clean.as_os_str().is_empty() {
+        return Err(ExtrasError::InvalidPath(path.display().to_string()));
+    }
+
+    Ok(clean)
 }
 
 fn copy_directory_recursive(source: &Path, target: &Path) -> Result<(), ExtrasError> {
@@ -161,23 +185,6 @@ fn run_git_lines(
         .filter(|line| !line.is_empty())
         .map(PathBuf::from)
         .collect())
-}
-
-fn validate_relative_path(path: &Path) -> Result<(), ExtrasError> {
-    if path.is_absolute() {
-        return Err(ExtrasError::InvalidPath(path.display().to_string()));
-    }
-
-    for component in path.components() {
-        if matches!(
-            component,
-            Component::ParentDir | Component::RootDir | Component::Prefix(_)
-        ) {
-            return Err(ExtrasError::InvalidPath(path.display().to_string()));
-        }
-    }
-
-    Ok(())
 }
 
 #[cfg(test)]
@@ -287,6 +294,19 @@ mod tests {
         let error = copy_selected_extras(&repo_root, &target_root, &[PathBuf::from("../secret")])
             .expect_err("expected path validation error");
 
+        assert!(matches!(error, ExtrasError::InvalidPath(_)));
+    }
+
+    #[test]
+    fn normalize_extra_relative_path_cleans_curdir_segments() {
+        let normalized =
+            normalize_extra_relative_path(Path::new("./a/./b.txt")).expect("normalized path");
+        assert_eq!(normalized, PathBuf::from("a/b.txt"));
+    }
+
+    #[test]
+    fn normalize_extra_relative_path_rejects_empty_clean_path() {
+        let error = normalize_extra_relative_path(Path::new(".")).expect_err("invalid path");
         assert!(matches!(error, ExtrasError::InvalidPath(_)));
     }
 }

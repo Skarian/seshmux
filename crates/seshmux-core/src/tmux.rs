@@ -2,6 +2,7 @@ use std::path::Path;
 
 use thiserror::Error;
 
+use crate::command_adapter;
 use crate::command_runner::CommandRunner;
 use crate::config::WindowSpec;
 use crate::names::sanitize_repo_component;
@@ -181,16 +182,13 @@ fn run_tmux_checked(
 ) -> Result<(), TmuxError> {
     let arg_refs: Vec<&str> = args.iter().map(|value| value.as_ref()).collect();
     let output = run_tmux(runner, &arg_refs, cwd)?;
-
-    if output.status_code != 0 {
-        return Err(TmuxError::CommandFailed {
-            command: arg_refs.join(" "),
-            status: output.status_code,
-            stderr: output.stderr.trim().to_string(),
-        });
-    }
-
-    Ok(())
+    command_adapter::ensure_success(&arg_refs, output)
+        .map(|_| ())
+        .map_err(|failure| TmuxError::CommandFailed {
+            command: failure.command,
+            status: failure.status,
+            stderr: failure.stderr,
+        })
 }
 
 fn run_tmux(
@@ -198,9 +196,7 @@ fn run_tmux(
     args: &[&str],
     cwd: Option<&Path>,
 ) -> Result<crate::command_runner::CommandOutput, TmuxError> {
-    runner
-        .run("tmux", args, cwd)
-        .map_err(|error| TmuxError::Execute(error.to_string()))
+    command_adapter::run_program(runner, "tmux", args, cwd).map_err(TmuxError::Execute)
 }
 
 #[cfg(test)]

@@ -4,6 +4,8 @@ use anyhow::{Context, Result, bail};
 use thiserror::Error;
 
 use crate::App;
+use crate::runtime;
+use crate::target;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttachRequest {
@@ -33,26 +35,12 @@ pub enum AttachError {
 
 impl<'a> App<'a> {
     pub fn attach(&self, request: AttachRequest) -> Result<AttachResult> {
-        let repo_root =
-            seshmux_core::git::repo_root(&request.cwd, self.runner).with_context(|| {
-                format!(
-                    "failed to resolve git repository root from {}",
-                    request.cwd.display()
-                )
-            })?;
-
-        let entry = seshmux_core::registry::find_entry_by_name(&repo_root, &request.worktree_name)
-            .with_context(|| {
-                format!(
-                    "failed to inspect worktree registry at {}",
-                    seshmux_core::registry::registry_path(&repo_root).display()
-                )
-            })?
+        let target = target::resolve_target(self, &request.cwd, &request.worktree_name)?
             .ok_or_else(|| AttachError::UnknownWorktree {
                 name: request.worktree_name.clone(),
             })?;
 
-        let worktree_path = PathBuf::from(&entry.path);
+        let worktree_path = target.worktree_path.clone();
         if !worktree_path.exists() {
             bail!(
                 "worktree path does not exist on disk: {}",
@@ -60,21 +48,17 @@ impl<'a> App<'a> {
             );
         }
 
-        let repo_component = repo_root
-            .file_name()
-            .and_then(|value| value.to_str())
-            .unwrap_or("repo");
-        let session_name = seshmux_core::tmux::session_name(repo_component, &entry.name);
+        let session_name = target.session_name.clone();
 
         let session_exists = seshmux_core::tmux::session_exists(&session_name, self.runner)
             .with_context(|| format!("failed to query tmux session '{session_name}'"))?;
 
         if session_exists {
-            seshmux_core::tmux::connect_session(&session_name, is_inside_tmux(), self.runner)
+            seshmux_core::tmux::connect_session(&session_name, runtime::inside_tmux(), self.runner)
                 .with_context(|| format!("failed to connect to tmux session '{session_name}'"))?;
 
             return Ok(AttachResult {
-                worktree_name: entry.name,
+                worktree_name: target.worktree_name,
                 worktree_path,
                 session_name,
                 created_session: false,
@@ -83,7 +67,7 @@ impl<'a> App<'a> {
 
         if !request.create_if_missing {
             return Err(AttachError::MissingSession {
-                worktree_name: entry.name,
+                worktree_name: target.worktree_name,
                 session_name,
             }
             .into());
@@ -99,18 +83,14 @@ impl<'a> App<'a> {
         )
         .with_context(|| format!("failed to create tmux session '{session_name}'"))?;
 
-        seshmux_core::tmux::connect_session(&session_name, is_inside_tmux(), self.runner)
+        seshmux_core::tmux::connect_session(&session_name, runtime::inside_tmux(), self.runner)
             .with_context(|| format!("failed to connect to tmux session '{session_name}'"))?;
 
         Ok(AttachResult {
-            worktree_name: entry.name,
+            worktree_name: target.worktree_name,
             worktree_path,
             session_name,
             created_session: true,
         })
     }
-}
-
-fn is_inside_tmux() -> bool {
-    std::env::var_os("TMUX").is_some()
 }

@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, anyhow, bail};
 
 use crate::App;
+use crate::runtime;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewPrepare {
@@ -41,12 +42,7 @@ pub struct NewResult {
 
 impl<'a> App<'a> {
     pub fn new_prepare(&self, cwd: &Path) -> Result<NewPrepare> {
-        let repo_root = seshmux_core::git::repo_root(cwd, self.runner).with_context(|| {
-            format!(
-                "failed to resolve git repository root from {}",
-                cwd.display()
-            )
-        })?;
+        let repo_root = runtime::resolve_repo_root(self, cwd)?;
         let worktrees_dir = repo_root.join("worktrees");
         let gitignore_has_worktrees_entry =
             seshmux_core::git::gitignore_contains_worktrees(&repo_root).with_context(|| {
@@ -94,13 +90,7 @@ impl<'a> App<'a> {
         seshmux_core::names::validate_worktree_name(&request.worktree_name)
             .with_context(|| format!("invalid worktree name '{}'", request.worktree_name))?;
 
-        let repo_root =
-            seshmux_core::git::repo_root(&request.cwd, self.runner).with_context(|| {
-                format!(
-                    "failed to resolve git repository root from {}",
-                    request.cwd.display()
-                )
-            })?;
+        let repo_root = runtime::resolve_repo_root(self, &request.cwd)?;
 
         let worktrees_dir = repo_root.join("worktrees");
         std::fs::create_dir_all(&worktrees_dir)
@@ -187,12 +177,7 @@ impl<'a> App<'a> {
             )
         })?;
 
-        let repo_component = repo_root
-            .file_name()
-            .and_then(|value| value.to_str())
-            .unwrap_or("repo");
-
-        let session_name = seshmux_core::tmux::session_name(repo_component, &request.worktree_name);
+        let session_name = runtime::session_name_for(&repo_root, &request.worktree_name);
         let attach_command = format!("tmux attach-session -t {session_name}");
 
         seshmux_core::tmux::create_session_and_windows(
@@ -209,12 +194,16 @@ impl<'a> App<'a> {
 
         let mut connected_now = false;
         if request.connect_now {
-            seshmux_core::tmux::connect_session(&session_name, is_inside_tmux(), self.runner)
-                .with_context(|| {
-                    format!(
-                        "failed to connect to tmux session '{session_name}'; attach manually with '{attach_command}'"
-                    )
-                })?;
+            seshmux_core::tmux::connect_session(
+                &session_name,
+                runtime::inside_tmux(),
+                self.runner,
+            )
+            .with_context(|| {
+                format!(
+                    "failed to connect to tmux session '{session_name}'; attach manually with '{attach_command}'"
+                )
+            })?;
             connected_now = true;
         }
 
@@ -228,8 +217,4 @@ impl<'a> App<'a> {
             connected_now,
         })
     }
-}
-
-fn is_inside_tmux() -> bool {
-    std::env::var_os("TMUX").is_some()
 }

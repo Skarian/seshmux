@@ -1,132 +1,11 @@
-use std::collections::VecDeque;
+mod support;
+
 use std::fs;
-use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 
-use anyhow::anyhow;
 use seshmux_app::{App, AttachError, AttachRequest, DeleteRequest};
-use seshmux_core::command_runner::{CommandOutput, CommandRunner};
-use seshmux_core::registry::{RegistryEntry, insert_unique_entry, load_registry};
+use seshmux_core::registry::load_registry;
 
-static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-#[derive(Debug, Clone)]
-struct Call {
-    program: String,
-    args: Vec<String>,
-    interactive: bool,
-}
-
-#[derive(Default)]
-struct QueueRunner {
-    outputs: Mutex<VecDeque<anyhow::Result<CommandOutput>>>,
-    interactive_statuses: Mutex<VecDeque<anyhow::Result<i32>>>,
-    calls: Mutex<Vec<Call>>,
-}
-
-impl QueueRunner {
-    fn new(
-        outputs: Vec<anyhow::Result<CommandOutput>>,
-        interactive_statuses: Vec<anyhow::Result<i32>>,
-    ) -> Self {
-        Self {
-            outputs: Mutex::new(outputs.into()),
-            interactive_statuses: Mutex::new(interactive_statuses.into()),
-            calls: Mutex::new(Vec::new()),
-        }
-    }
-
-    fn calls(&self) -> Vec<Call> {
-        self.calls.lock().expect("calls lock").clone()
-    }
-}
-
-impl CommandRunner for QueueRunner {
-    fn run(
-        &self,
-        program: &str,
-        args: &[&str],
-        _cwd: Option<&Path>,
-    ) -> anyhow::Result<CommandOutput> {
-        self.calls.lock().expect("calls lock").push(Call {
-            program: program.to_string(),
-            args: args.iter().map(|value| (*value).to_string()).collect(),
-            interactive: false,
-        });
-
-        self.outputs
-            .lock()
-            .expect("outputs lock")
-            .pop_front()
-            .unwrap_or_else(|| Err(anyhow!("missing scripted output")))
-    }
-
-    fn run_interactive(
-        &self,
-        program: &str,
-        args: &[&str],
-        _cwd: Option<&Path>,
-    ) -> anyhow::Result<i32> {
-        self.calls.lock().expect("calls lock").push(Call {
-            program: program.to_string(),
-            args: args.iter().map(|value| (*value).to_string()).collect(),
-            interactive: true,
-        });
-
-        self.interactive_statuses
-            .lock()
-            .expect("interactive lock")
-            .pop_front()
-            .unwrap_or_else(|| Err(anyhow!("missing scripted interactive status")))
-    }
-}
-
-fn output(stdout: &str, stderr: &str, status: i32) -> anyhow::Result<CommandOutput> {
-    Ok(CommandOutput {
-        status_code: status,
-        stdout: stdout.to_string(),
-        stderr: stderr.to_string(),
-    })
-}
-
-fn write_valid_config(home: &Path) {
-    let config_dir = home.join(".config").join("seshmux");
-    fs::create_dir_all(&config_dir).expect("create config dir");
-    fs::write(
-        config_dir.join("config.toml"),
-        r#"
-version = 1
-
-[[tmux.windows]]
-name = "editor"
-program = "nvim"
-args = []
-
-[[tmux.windows]]
-name = "git"
-program = "lazygit"
-args = []
-"#,
-    )
-    .expect("write config");
-}
-
-fn add_registry_entry(repo_root: &Path, name: &str, created_at: &str) -> PathBuf {
-    let path = repo_root.join("worktrees").join(name);
-    fs::create_dir_all(&path).expect("create worktree dir");
-
-    insert_unique_entry(
-        repo_root,
-        RegistryEntry {
-            name: name.to_string(),
-            path: path.to_string_lossy().to_string(),
-            created_at: created_at.to_string(),
-        },
-    )
-    .expect("insert registry");
-
-    path
-}
+use support::{ENV_LOCK, QueueRunner, add_registry_entry, output, write_valid_config};
 
 #[test]
 fn list_sorts_by_recency_and_includes_runtime_fields() {
@@ -196,7 +75,7 @@ fn attach_creates_session_when_missing_and_connects() {
     let _guard = ENV_LOCK.lock().expect("env lock");
 
     let temp = tempfile::tempdir().expect("temp dir");
-    write_valid_config(temp.path());
+    write_valid_config(temp.path(), true);
     unsafe {
         std::env::set_var("HOME", temp.path());
     }
@@ -268,11 +147,13 @@ fn delete_with_all_options_kills_session_removes_worktree_and_branch() {
             worktree_name: "w1".to_string(),
             kill_tmux_session: true,
             delete_branch: true,
+            force_worktree: false,
         })
         .expect("delete result");
 
     assert_eq!(result.worktree_path, worktree_path);
     assert!(result.branch_deleted);
+    assert!(result.branch_delete_error.is_none());
     assert!(load_registry(&repo_root).expect("registry load").is_empty());
 }
 
@@ -299,9 +180,17 @@ fn delete_keeps_branch_when_not_fully_merged() {
             worktree_name: "w1".to_string(),
             kill_tmux_session: false,
             delete_branch: true,
+            force_worktree: false,
         })
         .expect("delete should still succeed");
 
     assert!(!result.branch_deleted);
+    assert!(
+        result
+            .branch_delete_error
+            .as_deref()
+            .unwrap_or("")
+            .contains("not fully merged")
+    );
     assert!(load_registry(&repo_root).expect("registry load").is_empty());
 }

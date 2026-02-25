@@ -2,15 +2,15 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent};
-use ratatui::layout::{Constraint, Direction, Layout, Margin};
-use ratatui::style::{Color, Modifier, Style};
-use ratatui::widgets::{
-    Block, Borders, Paragraph, Row, Scrollbar, ScrollbarOrientation, ScrollbarState, Table,
-    TableState,
-};
-use seshmux_app::{App, ListResult, WorktreeRow};
+use ratatui::layout::{Constraint, Direction, Layout};
+use ratatui::style::Color;
+use seshmux_app::{App, ListResult};
 
 use crate::UiExit;
+use crate::theme;
+use crate::ui::select_step::{SelectSignal, SelectStepState};
+use crate::ui::text::{compact_hint, wrapped_paragraph};
+use crate::ui::worktree_table::{TableColumn, WorktreeTableRender};
 
 pub(crate) trait ListFlowOps {
     fn list_worktrees(&self, cwd: &Path) -> Result<ListResult>;
@@ -30,8 +30,7 @@ enum FlowSignal {
 
 #[derive(Debug)]
 struct ListFlow {
-    rows: Vec<WorktreeRow>,
-    selected: usize,
+    select: SelectStepState,
 }
 
 pub(crate) struct ListScreen {
@@ -63,118 +62,112 @@ impl ListFlow {
     fn new(ops: &dyn ListFlowOps, cwd: &Path) -> Result<Self> {
         let result = ops.list_worktrees(cwd)?;
         Ok(Self {
-            rows: result.rows,
-            selected: 0,
+            select: SelectStepState::new(result.rows),
         })
     }
 
     fn on_key(&mut self, key: KeyEvent, ops: &dyn ListFlowOps, cwd: &Path) -> Result<FlowSignal> {
-        match key.code {
-            KeyCode::Esc => Ok(FlowSignal::Exit(UiExit::BackAtRoot)),
-            KeyCode::Up | KeyCode::Char('k') => {
-                self.selected = self.selected.saturating_sub(1);
-                Ok(FlowSignal::Continue)
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                if self.selected + 1 < self.rows.len() {
-                    self.selected += 1;
-                }
-                Ok(FlowSignal::Continue)
-            }
-            KeyCode::Char('r') | KeyCode::Enter => {
+        match self.select.on_key(key) {
+            SelectSignal::Back => return Ok(FlowSignal::Exit(UiExit::BackAtRoot)),
+            SelectSignal::Continue => {}
+            SelectSignal::Confirm => {
                 let result = ops.list_worktrees(cwd)?;
-                self.rows = result.rows;
-                if self.rows.is_empty() {
-                    self.selected = 0;
-                } else if self.selected >= self.rows.len() {
-                    self.selected = self.rows.len() - 1;
-                }
-                Ok(FlowSignal::Continue)
+                self.select.set_rows(result.rows);
+                return Ok(FlowSignal::Continue);
             }
-            _ => Ok(FlowSignal::Continue),
         }
+
+        if key.code == KeyCode::Char('r') && !self.select.filter_focused() {
+            let result = ops.list_worktrees(cwd)?;
+            self.select.set_rows(result.rows);
+        }
+
+        Ok(FlowSignal::Continue)
     }
 
     fn render(&self, frame: &mut ratatui::Frame<'_>) {
         let area = frame.area();
-        let [body, footer] = Layout::default()
+        let [filter_area, body, footer] = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Min(10), Constraint::Length(3)])
+            .constraints([
+                Constraint::Length(3),
+                Constraint::Min(8),
+                Constraint::Length(3),
+            ])
             .areas(area);
 
-        if self.rows.is_empty() {
-            let empty = Paragraph::new("No worktrees are registered.").block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title("List: worktrees"),
-            );
-            frame.render_widget(empty, body);
-        } else {
-            let header = Row::new(["Name", "Created", "Branch", "Session", "Path"]).style(
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            );
-            let rows = self.rows.iter().map(|row| {
+        self.select.render_filter(
+            frame,
+            filter_area,
+            "Filter (focused)",
+            "Filter (Tab to focus)",
+        );
+
+        let columns = [
+            TableColumn {
+                title: "Name",
+                width: Constraint::Length(24),
+            },
+            TableColumn {
+                title: "Created",
+                width: Constraint::Length(28),
+            },
+            TableColumn {
+                title: "Branch",
+                width: Constraint::Length(20),
+            },
+            TableColumn {
+                title: "Session",
+                width: Constraint::Length(14),
+            },
+            TableColumn {
+                title: "Path",
+                width: Constraint::Min(24),
+            },
+        ];
+
+        self.select.render_table(
+            frame,
+            body,
+            WorktreeTableRender {
+                title: "List: worktrees",
+                empty_message: "No worktrees are registered.",
+                columns: &columns,
+                header_style: theme::table_header(Color::Cyan),
+                highlight_style: theme::table_highlight(Color::Cyan),
+            },
+            |row| {
                 let status = if row.session_running {
                     "running"
                 } else {
                     "not running"
                 };
-                Row::new(vec![
+                vec![
                     row.name.clone(),
                     row.created_at.clone(),
                     row.branch.clone(),
                     status.to_string(),
                     row.path.display().to_string(),
-                ])
-            });
-            let table = Table::new(
-                rows,
-                [
-                    Constraint::Length(24),
-                    Constraint::Length(28),
-                    Constraint::Length(20),
-                    Constraint::Length(14),
-                    Constraint::Min(24),
-                ],
-            )
-            .header(header)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title("List: worktrees"),
-            )
-            .row_highlight_style(
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            )
-            .highlight_symbol(">> ");
+                ]
+            },
+        );
 
-            let mut state = TableState::new();
-            state.select(Some(self.selected));
-            frame.render_stateful_widget(table, body, &mut state);
-
-            let viewport = body.height.saturating_sub(3) as usize;
-            let mut scrollbar_state = ScrollbarState::new(self.rows.len())
-                .position(self.selected)
-                .viewport_content_length(viewport);
-            frame.render_stateful_widget(
-                Scrollbar::new(ScrollbarOrientation::VerticalRight)
-                    .begin_symbol(None)
-                    .end_symbol(None),
-                body.inner(Margin {
-                    vertical: 1,
-                    horizontal: 0,
-                }),
-                &mut scrollbar_state,
-            );
-        }
-
-        let keys = Paragraph::new("Up/Down or j/k: move    Enter/r: refresh    Esc: back")
-            .block(Block::default().borders(Borders::ALL).title("Keys"));
+        let key_text = if self.select.filter_focused() {
+            compact_hint(
+                area.width,
+                "Type: filter    Backspace: delete    Tab: list focus    Esc: back",
+                "Type filter    Backspace delete    Tab: list    Esc: back",
+                "Type filter | Backspace | Tab list | Esc back",
+            )
+        } else {
+            compact_hint(
+                area.width,
+                "Tab: filter focus    Up/Down or j/k: move    Enter/r: refresh    Esc: back",
+                "Tab: filter    j/k: move    Enter/r: refresh    Esc: back",
+                "Tab filter | j/k move | Enter refresh | Esc back",
+            )
+        };
+        let keys = wrapped_paragraph(key_text).block(theme::key_block());
         frame.render_widget(keys, footer);
     }
 }
@@ -242,10 +235,63 @@ mod tests {
 
         flow.on_key(key(KeyCode::Char('j')), &ops, Path::new("/tmp/repo"))
             .expect("down");
-        assert_eq!(flow.selected, 1);
+        assert_eq!(flow.select.selected(), 1);
 
         flow.on_key(key(KeyCode::Char('k')), &ops, Path::new("/tmp/repo"))
             .expect("up");
-        assert_eq!(flow.selected, 0);
+        assert_eq!(flow.select.selected(), 0);
+    }
+
+    #[test]
+    fn enter_refreshes_rows() {
+        let ops = FakeOps {
+            rows: vec![WorktreeRow {
+                name: "w1".to_string(),
+                path: PathBuf::from("/tmp/repo/worktrees/w1"),
+                created_at: "2026-02-25T10:00:00Z".to_string(),
+                branch: "w1".to_string(),
+                session_name: "repo/w1".to_string(),
+                session_running: false,
+            }],
+        };
+        let mut flow = ListFlow::new(&ops, Path::new("/tmp/repo")).expect("flow");
+
+        flow.on_key(key(KeyCode::Enter), &ops, Path::new("/tmp/repo"))
+            .expect("refresh");
+        assert_eq!(flow.select.filtered_len(), 1);
+    }
+
+    #[test]
+    fn tab_focus_routes_text_input_to_filter() {
+        let ops = FakeOps {
+            rows: vec![
+                WorktreeRow {
+                    name: "w1".to_string(),
+                    path: PathBuf::from("/tmp/repo/worktrees/w1"),
+                    created_at: "2026-02-25T10:00:00Z".to_string(),
+                    branch: "w1".to_string(),
+                    session_name: "repo/w1".to_string(),
+                    session_running: false,
+                },
+                WorktreeRow {
+                    name: "w2".to_string(),
+                    path: PathBuf::from("/tmp/repo/worktrees/w2"),
+                    created_at: "2026-02-25T11:00:00Z".to_string(),
+                    branch: "w2".to_string(),
+                    session_name: "repo/w2".to_string(),
+                    session_running: false,
+                },
+            ],
+        };
+        let mut flow = ListFlow::new(&ops, Path::new("/tmp/repo")).expect("flow");
+
+        flow.on_key(key(KeyCode::Tab), &ops, Path::new("/tmp/repo"))
+            .expect("focus filter");
+        assert!(flow.select.filter_focused());
+
+        flow.on_key(key(KeyCode::Char('j')), &ops, Path::new("/tmp/repo"))
+            .expect("type filter");
+        assert_eq!(flow.select.selected(), 0);
+        assert_eq!(flow.select.filtered_len(), 0);
     }
 }

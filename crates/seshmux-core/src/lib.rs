@@ -1,3 +1,4 @@
+pub(crate) mod command_adapter;
 pub mod command_runner;
 pub mod config;
 pub mod doctor;

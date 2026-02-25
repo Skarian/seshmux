@@ -68,7 +68,15 @@ The root TUI menu includes:
 - `Attach session`
 - `Delete worktree`
 
+Delete behavior:
+
+- Delete first attempts safe worktree removal.
+- If safe worktree removal fails, seshmux shows the git error and asks whether to force delete.
+- If safe branch deletion fails, seshmux shows the git error and asks whether to force delete the branch.
+
 ## Key Semantics
 
 - `Esc`: back one step inside flows. On first step of a flow, returns to root. From root, exits the TUI.
 - `q`: exits the TUI from root.
+- Yes/No prompts: `Space` toggles selection and `Enter` confirms.
+- List/filter screens (`list`, `attach`, `delete`): `Tab` toggles focus between the table and filter input. `j/k` table movement applies only in table focus.

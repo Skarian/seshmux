@@ -76,11 +76,13 @@ fn delete_removes_worktree_folder_and_registry_entry_in_real_repo() {
             worktree_name: "w1".to_string(),
             kill_tmux_session: false,
             delete_branch: false,
+            force_worktree: false,
         })
         .expect("delete should succeed");
 
     assert_eq!(result.worktree_name, "w1");
     assert!(!result.branch_deleted);
+    assert!(result.branch_delete_error.is_none());
     assert!(!worktree_path.exists());
     assert!(
         find_entry_by_name(&repo_root, "w1")
