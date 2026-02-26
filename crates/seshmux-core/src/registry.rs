@@ -75,23 +75,8 @@ pub fn ensure_entry_available(
     path: &Path,
 ) -> Result<(), RegistryError> {
     let entries = load_registry(repo_root)?;
-    let path_value = path.to_string_lossy().to_string();
-
-    for entry in entries {
-        if entry.name == name {
-            return Err(RegistryError::DuplicateName {
-                name: name.to_string(),
-            });
-        }
-
-        if entry.path == path_value {
-            return Err(RegistryError::DuplicatePath {
-                path: path_value.clone(),
-            });
-        }
-    }
-
-    Ok(())
+    let path_value = path.to_string_lossy();
+    ensure_unique_entry(&entries, name, path_value.as_ref())
 }
 
 pub fn find_entry_by_name(
@@ -120,23 +105,30 @@ pub fn remove_entry_by_name(
 
 pub fn insert_unique_entry(repo_root: &Path, entry: RegistryEntry) -> Result<(), RegistryError> {
     let mut entries = load_registry(repo_root)?;
-
-    for existing in &entries {
-        if existing.name == entry.name {
-            return Err(RegistryError::DuplicateName {
-                name: entry.name.clone(),
-            });
-        }
-
-        if existing.path == entry.path {
-            return Err(RegistryError::DuplicatePath {
-                path: entry.path.clone(),
-            });
-        }
-    }
+    ensure_unique_entry(&entries, &entry.name, &entry.path)?;
 
     entries.push(entry);
     write_registry(repo_root, entries)
+}
+
+fn ensure_unique_entry(
+    entries: &[RegistryEntry],
+    name: &str,
+    path: &str,
+) -> Result<(), RegistryError> {
+    if entries.iter().any(|entry| entry.name == name) {
+        return Err(RegistryError::DuplicateName {
+            name: name.to_string(),
+        });
+    }
+
+    if entries.iter().any(|entry| entry.path == path) {
+        return Err(RegistryError::DuplicatePath {
+            path: path.to_string(),
+        });
+    }
+
+    Ok(())
 }
 
 fn write_registry(repo_root: &Path, entries: Vec<RegistryEntry>) -> Result<(), RegistryError> {

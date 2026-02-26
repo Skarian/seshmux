@@ -3,7 +3,7 @@ use std::fmt;
 use std::path::Path;
 
 use crate::command_runner::{CommandRunner, SystemCommandRunner};
-use crate::config::{WindowSpec, load_config, resolve_config_path};
+use crate::config::{WindowSpec, load_config, parse_window_launch, resolve_config_path};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CheckState {
@@ -58,33 +58,20 @@ pub fn run_doctor() -> DoctorReport {
 pub fn run_doctor_with_runner(runner: &dyn CommandRunner) -> DoctorReport {
     let mut checks = Vec::new();
 
-    if env::consts::OS == "macos" {
-        checks.push(DoctorCheck {
-            name: "os is macOS".to_string(),
-            state: CheckState::Pass,
-            details: "detected macOS".to_string(),
-        });
+    checks.push(if env::consts::OS == "macos" {
+        pass_check("os is macOS", "detected macOS")
     } else {
-        checks.push(DoctorCheck {
-            name: "os is macOS".to_string(),
-            state: CheckState::Fail,
-            details: format!("detected {}, expected macOS", env::consts::OS),
-        });
-    }
+        fail_check(
+            "os is macOS",
+            format!("detected {}, expected macOS", env::consts::OS),
+        )
+    });
 
-    if is_executable_in_path("git") {
-        checks.push(DoctorCheck {
-            name: "git is installed".to_string(),
-            state: CheckState::Pass,
-            details: "git executable found in PATH".to_string(),
-        });
+    checks.push(if is_executable_in_path("git") {
+        pass_check("git is installed", "git executable found in PATH")
     } else {
-        checks.push(DoctorCheck {
-            name: "git is installed".to_string(),
-            state: CheckState::Fail,
-            details: "git executable not found in PATH".to_string(),
-        });
-    }
+        fail_check("git is installed", "git executable not found in PATH")
+    });
 
     checks.push(check_git_worktree_support(runner));
     checks.push(check_tmux_callable(runner));
@@ -92,80 +79,50 @@ pub fn run_doctor_with_runner(runner: &dyn CommandRunner) -> DoctorReport {
     match resolve_config_path() {
         Ok(config_path) => {
             if config_path.exists() {
-                checks.push(DoctorCheck {
-                    name: "config file exists".to_string(),
-                    state: CheckState::Pass,
-                    details: format!("found at {}", config_path.display()),
-                });
+                checks.push(pass_check(
+                    "config file exists",
+                    format!("found at {}", config_path.display()),
+                ));
 
                 match load_config(&config_path) {
                     Ok(config) => {
-                        checks.push(DoctorCheck {
-                            name: "config parses and validates".to_string(),
-                            state: CheckState::Pass,
-                            details: "config is valid".to_string(),
-                        });
-
+                        checks.push(pass_check("config parses and validates", "config is valid"));
                         checks.push(check_window_targets(&config.tmux.windows));
                     }
                     Err(error) => {
-                        checks.push(DoctorCheck {
-                            name: "config parses and validates".to_string(),
-                            state: CheckState::Fail,
-                            details: error.to_string(),
-                        });
-
-                        checks.push(DoctorCheck {
-                            name: "window launch targets executable".to_string(),
-                            state: CheckState::Fail,
-                            details: "skipped because config is invalid".to_string(),
-                        });
+                        checks.push(fail_check("config parses and validates", error.to_string()));
+                        checks.push(skipped_check(
+                            "window launch targets executable",
+                            "config is invalid",
+                        ));
                     }
                 }
             } else {
-                checks.push(DoctorCheck {
-                    name: "config file exists".to_string(),
-                    state: CheckState::Fail,
-                    details: format!("expected at {}", config_path.display()),
-                });
-
-                checks.push(DoctorCheck {
-                    name: "config parses and validates".to_string(),
-                    state: CheckState::Fail,
-                    details: "skipped because config file is missing".to_string(),
-                });
-
-                checks.push(DoctorCheck {
-                    name: "window launch targets executable".to_string(),
-                    state: CheckState::Fail,
-                    details: "skipped because config file is missing".to_string(),
-                });
+                checks.push(fail_check(
+                    "config file exists",
+                    format!("expected at {}", config_path.display()),
+                ));
+                push_skipped_checks(
+                    &mut checks,
+                    &[
+                        "config parses and validates",
+                        "window launch targets executable",
+                    ],
+                    "config file is missing",
+                );
             }
         }
         Err(error) => {
-            checks.push(DoctorCheck {
-                name: "config path resolves".to_string(),
-                state: CheckState::Fail,
-                details: error.to_string(),
-            });
-
-            checks.push(DoctorCheck {
-                name: "config file exists".to_string(),
-                state: CheckState::Fail,
-                details: "skipped because config path could not be resolved".to_string(),
-            });
-
-            checks.push(DoctorCheck {
-                name: "config parses and validates".to_string(),
-                state: CheckState::Fail,
-                details: "skipped because config path could not be resolved".to_string(),
-            });
-
-            checks.push(DoctorCheck {
-                name: "window launch targets executable".to_string(),
-                state: CheckState::Fail,
-                details: "skipped because config path could not be resolved".to_string(),
-            });
+            checks.push(fail_check("config path resolves", error.to_string()));
+            push_skipped_checks(
+                &mut checks,
+                &[
+                    "config file exists",
+                    "config parses and validates",
+                    "window launch targets executable",
+                ],
+                "config path could not be resolved",
+            );
         }
     }
 
@@ -177,51 +134,44 @@ fn check_git_worktree_support(runner: &dyn CommandRunner) -> DoctorCheck {
         Ok(output) => {
             let combined = format!("{}\n{}", output.stdout, output.stderr);
             if combined.contains("usage: git worktree") {
-                DoctorCheck {
-                    name: "git worktree available".to_string(),
-                    state: CheckState::Pass,
-                    details: "git worktree command is available".to_string(),
-                }
+                pass_check(
+                    "git worktree available",
+                    "git worktree command is available",
+                )
             } else {
-                DoctorCheck {
-                    name: "git worktree available".to_string(),
-                    state: CheckState::Fail,
-                    details: format!(
+                fail_check(
+                    "git worktree available",
+                    format!(
                         "git worktree help output did not match expected format (exit code {})",
                         output.status_code
                     ),
-                }
+                )
             }
         }
-        Err(error) => DoctorCheck {
-            name: "git worktree available".to_string(),
-            state: CheckState::Fail,
-            details: format!("failed to execute git worktree check: {error}"),
-        },
+        Err(error) => fail_check(
+            "git worktree available",
+            format!("failed to execute git worktree check: {error}"),
+        ),
     }
 }
 
 fn check_tmux_callable(runner: &dyn CommandRunner) -> DoctorCheck {
     match runner.run("tmux", &["-V"], None) {
-        Ok(output) if output.status_code == 0 => DoctorCheck {
-            name: "tmux is installed".to_string(),
-            state: CheckState::Pass,
-            details: output.stdout.trim().to_string(),
-        },
-        Ok(output) => DoctorCheck {
-            name: "tmux is installed".to_string(),
-            state: CheckState::Fail,
-            details: format!(
+        Ok(output) if output.status_code == 0 => {
+            pass_check("tmux is installed", output.stdout.trim().to_string())
+        }
+        Ok(output) => fail_check(
+            "tmux is installed",
+            format!(
                 "tmux returned exit code {} with output: {}",
                 output.status_code,
                 output.stderr.trim()
             ),
-        },
-        Err(error) => DoctorCheck {
-            name: "tmux is installed".to_string(),
-            state: CheckState::Fail,
-            details: format!("failed to execute tmux check: {error}"),
-        },
+        ),
+        Err(error) => fail_check(
+            "tmux is installed",
+            format!("failed to execute tmux check: {error}"),
+        ),
     }
 }
 
@@ -229,35 +179,65 @@ fn check_window_targets(windows: &[WindowSpec]) -> DoctorCheck {
     let mut missing_targets = Vec::new();
 
     for window in windows {
-        if let Some(program) = &window.program {
-            if !is_executable_in_path(program) {
-                missing_targets.push(format!("window '{}' program '{}'", window.name, program));
+        let launch = match parse_window_launch(window) {
+            Ok(launch) => launch,
+            Err(_) => {
+                missing_targets.push(format!("window '{}' has invalid launch mode", window.name));
+                continue;
             }
-        }
+        };
 
-        if let Some(shell) = &window.shell {
-            if let Some(executable) = shell.first() {
-                if !is_executable_in_path(executable) {
-                    missing_targets
-                        .push(format!("window '{}' shell '{}'", window.name, executable));
-                }
-            }
+        let executable = launch.executable();
+        if !is_executable_in_path(executable) {
+            missing_targets.push(format!(
+                "window '{}' {} '{}'",
+                window.name,
+                launch.executable_label(),
+                executable
+            ));
         }
     }
 
     if missing_targets.is_empty() {
-        DoctorCheck {
-            name: "window launch targets executable".to_string(),
-            state: CheckState::Pass,
-            details: "all configured launch targets were found in PATH".to_string(),
-        }
+        pass_check(
+            "window launch targets executable",
+            "all configured launch targets were found in PATH",
+        )
     } else {
-        DoctorCheck {
-            name: "window launch targets executable".to_string(),
-            state: CheckState::Fail,
-            details: format!("missing executables: {}", missing_targets.join(", ")),
-        }
+        fail_check(
+            "window launch targets executable",
+            format!("missing executables: {}", missing_targets.join(", ")),
+        )
     }
+}
+
+fn pass_check(name: &str, details: impl Into<String>) -> DoctorCheck {
+    DoctorCheck {
+        name: name.to_string(),
+        state: CheckState::Pass,
+        details: details.into(),
+    }
+}
+
+fn fail_check(name: &str, details: impl Into<String>) -> DoctorCheck {
+    DoctorCheck {
+        name: name.to_string(),
+        state: CheckState::Fail,
+        details: details.into(),
+    }
+}
+
+fn skipped_check(name: &str, reason: &str) -> DoctorCheck {
+    fail_check(name, format!("skipped because {reason}"))
+}
+
+fn push_skipped_checks(checks: &mut Vec<DoctorCheck>, names: &[&str], reason: &str) {
+    checks.extend(
+        names
+            .iter()
+            .copied()
+            .map(|name| skipped_check(name, reason)),
+    );
 }
 
 fn is_executable_in_path(program: &str) -> bool {

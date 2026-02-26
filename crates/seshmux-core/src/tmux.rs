@@ -4,7 +4,7 @@ use thiserror::Error;
 
 use crate::command_adapter;
 use crate::command_runner::CommandRunner;
-use crate::config::WindowSpec;
+use crate::config::{WindowSpec, parse_window_launch};
 use crate::names::sanitize_repo_component;
 
 #[derive(Debug, Error)]
@@ -116,63 +116,11 @@ pub fn kill_session(session: &str, runner: &dyn CommandRunner) -> Result<(), Tmu
 }
 
 fn build_window_launch(window: &WindowSpec) -> Result<Vec<String>, TmuxError> {
-    let direct_mode = window.program.is_some() || window.args.is_some();
-    let shell_mode = window.shell.is_some() || window.command.is_some();
-
-    if direct_mode && shell_mode {
-        return Err(TmuxError::InvalidWindowMode {
+    parse_window_launch(window)
+        .map(|launch| launch.into_command_parts())
+        .map_err(|_| TmuxError::InvalidWindowMode {
             window: window.name.clone(),
-        });
-    }
-
-    if !direct_mode && !shell_mode {
-        return Err(TmuxError::InvalidWindowMode {
-            window: window.name.clone(),
-        });
-    }
-
-    if direct_mode {
-        let program = window
-            .program
-            .clone()
-            .filter(|value| !value.trim().is_empty())
-            .ok_or_else(|| TmuxError::InvalidWindowMode {
-                window: window.name.clone(),
-            })?;
-
-        let mut parts = vec![program];
-        if let Some(args) = &window.args {
-            parts.extend(args.clone());
-        }
-        return Ok(parts);
-    }
-
-    let shell = window
-        .shell
-        .clone()
-        .filter(|values| !values.is_empty())
-        .ok_or_else(|| TmuxError::InvalidWindowMode {
-            window: window.name.clone(),
-        })?;
-
-    if shell[0].trim().is_empty() {
-        return Err(TmuxError::InvalidWindowMode {
-            window: window.name.clone(),
-        });
-    }
-
-    let command = window
-        .command
-        .clone()
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| TmuxError::InvalidWindowMode {
-            window: window.name.clone(),
-        })?;
-
-    let mut parts = shell;
-    parts.push(command);
-
-    Ok(parts)
+        })
 }
 
 fn run_tmux_checked(
@@ -201,98 +149,12 @@ fn run_tmux(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::VecDeque;
-    use std::path::{Path, PathBuf};
-    use std::sync::Mutex;
+    use std::path::PathBuf;
 
-    use anyhow::anyhow;
-
-    use crate::command_runner::{CommandOutput, CommandRunner};
     use crate::config::WindowSpec;
+    use crate::test_support::{RecordingRunner, output};
 
     use super::*;
-
-    #[derive(Debug, Clone)]
-    struct Call {
-        program: String,
-        args: Vec<String>,
-        cwd: Option<PathBuf>,
-        interactive: bool,
-    }
-
-    #[derive(Default)]
-    struct RecordingRunner {
-        outputs: Mutex<VecDeque<anyhow::Result<CommandOutput>>>,
-        interactive_statuses: Mutex<VecDeque<anyhow::Result<i32>>>,
-        calls: Mutex<Vec<Call>>,
-    }
-
-    impl RecordingRunner {
-        fn new(
-            outputs: Vec<anyhow::Result<CommandOutput>>,
-            interactive_statuses: Vec<anyhow::Result<i32>>,
-        ) -> Self {
-            Self {
-                outputs: Mutex::new(outputs.into()),
-                interactive_statuses: Mutex::new(interactive_statuses.into()),
-                calls: Mutex::new(Vec::new()),
-            }
-        }
-
-        fn calls(&self) -> Vec<Call> {
-            self.calls.lock().expect("lock calls").clone()
-        }
-    }
-
-    impl CommandRunner for RecordingRunner {
-        fn run(
-            &self,
-            program: &str,
-            args: &[&str],
-            cwd: Option<&Path>,
-        ) -> anyhow::Result<CommandOutput> {
-            self.calls.lock().expect("lock calls").push(Call {
-                program: program.to_string(),
-                args: args.iter().map(|value| (*value).to_string()).collect(),
-                cwd: cwd.map(|value| value.to_path_buf()),
-                interactive: false,
-            });
-
-            self.outputs
-                .lock()
-                .expect("lock outputs")
-                .pop_front()
-                .unwrap_or_else(|| Err(anyhow!("missing output")))
-        }
-
-        fn run_interactive(
-            &self,
-            program: &str,
-            args: &[&str],
-            cwd: Option<&Path>,
-        ) -> anyhow::Result<i32> {
-            self.calls.lock().expect("lock calls").push(Call {
-                program: program.to_string(),
-                args: args.iter().map(|value| (*value).to_string()).collect(),
-                cwd: cwd.map(|value| value.to_path_buf()),
-                interactive: true,
-            });
-
-            self.interactive_statuses
-                .lock()
-                .expect("lock statuses")
-                .pop_front()
-                .unwrap_or_else(|| Err(anyhow!("missing interactive status")))
-        }
-    }
-
-    fn output(status_code: i32) -> anyhow::Result<CommandOutput> {
-        Ok(CommandOutput {
-            status_code,
-            stdout: String::new(),
-            stderr: String::new(),
-        })
-    }
 
     fn direct_window() -> WindowSpec {
         WindowSpec {
@@ -321,7 +183,7 @@ mod tests {
 
     #[test]
     fn create_session_and_windows_builds_direct_and_shell_commands() {
-        let runner = RecordingRunner::new(vec![output(0), output(0)], Vec::new());
+        let runner = RecordingRunner::new(vec![output("", "", 0), output("", "", 0)], Vec::new());
         let cwd = PathBuf::from("/tmp/project/worktrees/w1");
 
         create_session_and_windows(
@@ -378,7 +240,7 @@ mod tests {
 
     #[test]
     fn kill_session_invokes_tmux_kill_session() {
-        let runner = RecordingRunner::new(vec![output(0)], Vec::new());
+        let runner = RecordingRunner::new(vec![output("", "", 0)], Vec::new());
         kill_session("repo/w1", &runner).expect("kill");
 
         let calls = runner.calls();

@@ -68,27 +68,7 @@ pub fn copy_selected_extras(
 
         let source = repo_root.join(&normalized);
         let target = target_root.join(&normalized);
-
-        if source.is_dir() {
-            copy_directory_recursive(&source, &target)?;
-            continue;
-        }
-
-        if source.is_file() {
-            if let Some(parent) = target.parent() {
-                fs::create_dir_all(parent).map_err(|error| ExtrasError::Copy {
-                    from: source.display().to_string(),
-                    to: target.display().to_string(),
-                    error,
-                })?;
-            }
-
-            fs::copy(&source, &target).map_err(|error| ExtrasError::Copy {
-                from: source.display().to_string(),
-                to: target.display().to_string(),
-                error,
-            })?;
-        }
+        copy_existing_path(&source, &target)?;
     }
 
     Ok(())
@@ -119,46 +99,52 @@ pub fn normalize_extra_relative_path(path: &Path) -> Result<PathBuf, ExtrasError
 }
 
 fn copy_directory_recursive(source: &Path, target: &Path) -> Result<(), ExtrasError> {
-    fs::create_dir_all(target).map_err(|error| ExtrasError::Copy {
-        from: source.display().to_string(),
-        to: target.display().to_string(),
-        error,
-    })?;
-
-    for entry in fs::read_dir(source).map_err(|error| ExtrasError::Copy {
-        from: source.display().to_string(),
-        to: target.display().to_string(),
-        error,
-    })? {
-        let entry = entry.map_err(|error| ExtrasError::Copy {
-            from: source.display().to_string(),
-            to: target.display().to_string(),
-            error,
-        })?;
-
+    create_dir_all(source, target, target)?;
+    for entry in read_dir(source, source, target)? {
+        let entry = entry.map_err(|error| copy_error(source, target, error))?;
         let child_source = entry.path();
         let child_target = target.join(entry.file_name());
-
-        if child_source.is_dir() {
-            copy_directory_recursive(&child_source, &child_target)?;
-        } else if child_source.is_file() {
-            if let Some(parent) = child_target.parent() {
-                fs::create_dir_all(parent).map_err(|error| ExtrasError::Copy {
-                    from: child_source.display().to_string(),
-                    to: child_target.display().to_string(),
-                    error,
-                })?;
-            }
-
-            fs::copy(&child_source, &child_target).map_err(|error| ExtrasError::Copy {
-                from: child_source.display().to_string(),
-                to: child_target.display().to_string(),
-                error,
-            })?;
-        }
+        copy_existing_path(&child_source, &child_target)?;
     }
 
     Ok(())
+}
+
+fn copy_existing_path(source: &Path, target: &Path) -> Result<(), ExtrasError> {
+    if source.is_dir() {
+        return copy_directory_recursive(source, target);
+    }
+
+    if source.is_file() {
+        return copy_file(source, target);
+    }
+
+    Ok(())
+}
+
+fn copy_file(source: &Path, target: &Path) -> Result<(), ExtrasError> {
+    if let Some(parent) = target.parent() {
+        create_dir_all(source, target, parent)?;
+    }
+
+    fs::copy(source, target).map_err(|error| copy_error(source, target, error))?;
+    Ok(())
+}
+
+fn create_dir_all(from: &Path, to: &Path, dir: &Path) -> Result<(), ExtrasError> {
+    fs::create_dir_all(dir).map_err(|error| copy_error(from, to, error))
+}
+
+fn read_dir(dir: &Path, from: &Path, to: &Path) -> Result<fs::ReadDir, ExtrasError> {
+    fs::read_dir(dir).map_err(|error| copy_error(from, to, error))
+}
+
+fn copy_error(from: &Path, to: &Path, error: std::io::Error) -> ExtrasError {
+    ExtrasError::Copy {
+        from: from.display().to_string(),
+        to: to.display().to_string(),
+        error,
+    }
 }
 
 fn run_git_lines(
@@ -189,67 +175,17 @@ fn run_git_lines(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::VecDeque;
+    use crate::test_support::{RecordingRunner, output};
     use std::fs;
     use std::path::Path;
-    use std::sync::Mutex;
-
-    use anyhow::anyhow;
-
-    use crate::command_runner::{CommandOutput, CommandRunner};
 
     use super::*;
 
-    #[derive(Default)]
-    struct QueueRunner {
-        outputs: Mutex<VecDeque<anyhow::Result<CommandOutput>>>,
-    }
-
-    impl QueueRunner {
-        fn new(outputs: Vec<anyhow::Result<CommandOutput>>) -> Self {
-            Self {
-                outputs: Mutex::new(outputs.into()),
-            }
-        }
-    }
-
-    impl CommandRunner for QueueRunner {
-        fn run(
-            &self,
-            _program: &str,
-            _args: &[&str],
-            _cwd: Option<&Path>,
-        ) -> anyhow::Result<CommandOutput> {
-            self.outputs
-                .lock()
-                .expect("lock")
-                .pop_front()
-                .unwrap_or_else(|| Err(anyhow!("missing output")))
-        }
-
-        fn run_interactive(
-            &self,
-            _program: &str,
-            _args: &[&str],
-            _cwd: Option<&Path>,
-        ) -> anyhow::Result<i32> {
-            Err(anyhow!("interactive command not expected in this test"))
-        }
-    }
-
-    fn output(stdout: &str) -> anyhow::Result<CommandOutput> {
-        Ok(CommandOutput {
-            status_code: 0,
-            stdout: stdout.to_string(),
-            stderr: String::new(),
-        })
-    }
-
     #[test]
     fn list_extra_candidates_merges_and_deduplicates() {
-        let runner = QueueRunner::new(vec![
-            output("a.txt\ncommon.txt\n"),
-            output("common.txt\nb.txt\n"),
+        let runner = RecordingRunner::from_outputs(vec![
+            output("a.txt\ncommon.txt\n", "", 0),
+            output("common.txt\nb.txt\n", "", 0),
         ]);
         let entries = list_extra_candidates(Path::new("/tmp/repo"), &runner).expect("entries");
         assert_eq!(

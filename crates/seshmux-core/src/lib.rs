@@ -6,5 +6,7 @@ pub mod extras;
 pub mod git;
 pub mod names;
 pub mod registry;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub mod time;
 pub mod tmux;

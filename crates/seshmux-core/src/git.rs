@@ -57,15 +57,10 @@ pub enum GitError {
 
 pub fn repo_root(cwd: &Path, runner: &dyn CommandRunner) -> Result<PathBuf, GitError> {
     let output = run_git_checked(runner, &["rev-parse", "--show-toplevel"], Some(cwd))?;
-    let root = output
-        .stdout
-        .lines()
-        .next()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .ok_or_else(|| GitError::Parse("git rev-parse returned empty repo root".to_string()))?;
-
-    Ok(PathBuf::from(root))
+    Ok(PathBuf::from(first_non_empty_stdout_line(
+        &output,
+        "git rev-parse returned empty repo root",
+    )?))
 }
 
 pub fn gitignore_contains_worktrees(repo_root: &Path) -> Result<bool, GitError> {
@@ -132,9 +127,7 @@ pub fn create_worktree(
     start_point: &str,
     runner: &dyn CommandRunner,
 ) -> Result<(), GitError> {
-    let target = target_path
-        .to_str()
-        .ok_or_else(|| GitError::Parse("worktree path is not valid UTF-8".to_string()))?;
+    let target = utf8_path(target_path, "worktree path is not valid UTF-8")?;
 
     let args = ["worktree", "add", "-b", worktree_name, target, start_point];
     run_git_checked(runner, &args, Some(repo_root))?;
@@ -152,15 +145,7 @@ pub fn current_branch(
         Some(worktree_path),
     )?;
 
-    let branch = output
-        .stdout
-        .lines()
-        .next()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| GitError::Parse("git rev-parse returned empty branch name".to_string()))?;
-
-    Ok(branch.to_string())
+    first_non_empty_stdout_line(&output, "git rev-parse returned empty branch name")
 }
 
 pub fn remove_worktree(
@@ -168,9 +153,7 @@ pub fn remove_worktree(
     target_path: &Path,
     runner: &dyn CommandRunner,
 ) -> Result<(), GitError> {
-    let target = target_path
-        .to_str()
-        .ok_or_else(|| GitError::Parse("worktree path is not valid UTF-8".to_string()))?;
+    let target = utf8_path(target_path, "worktree path is not valid UTF-8")?;
 
     run_git_checked(runner, &["worktree", "remove", target], Some(repo_root))?;
     Ok(())
@@ -181,9 +164,7 @@ pub fn force_remove_worktree(
     target_path: &Path,
     runner: &dyn CommandRunner,
 ) -> Result<(), GitError> {
-    let target = target_path
-        .to_str()
-        .ok_or_else(|| GitError::Parse("worktree path is not valid UTF-8".to_string()))?;
+    let target = utf8_path(target_path, "worktree path is not valid UTF-8")?;
 
     run_git_checked(
         runner,
@@ -198,10 +179,7 @@ pub fn delete_branch(
     branch_name: &str,
     runner: &dyn CommandRunner,
 ) -> Result<(), GitError> {
-    let branch = branch_name.trim();
-    if branch.is_empty() {
-        return Err(GitError::Parse("branch name cannot be empty".to_string()));
-    }
+    let branch = non_empty_trimmed(branch_name, "branch name cannot be empty")?;
 
     let output = run_git(runner, &["branch", "-d", branch], Some(repo_root))?;
     if output.status_code == 0 {
@@ -226,10 +204,7 @@ pub fn force_delete_branch(
     branch_name: &str,
     runner: &dyn CommandRunner,
 ) -> Result<(), GitError> {
-    let branch = branch_name.trim();
-    if branch.is_empty() {
-        return Err(GitError::Parse("branch name cannot be empty".to_string()));
-    }
+    let branch = non_empty_trimmed(branch_name, "branch name cannot be empty")?;
 
     run_git_checked(runner, &["branch", "-D", branch], Some(repo_root))?;
     Ok(())
@@ -388,6 +363,32 @@ fn looks_like_branch_not_fully_merged(stderr: &str) -> bool {
     normalized.contains("not fully merged")
 }
 
+fn utf8_path<'a>(path: &'a Path, message: &str) -> Result<&'a str, GitError> {
+    path.to_str()
+        .ok_or_else(|| GitError::Parse(message.to_string()))
+}
+
+fn non_empty_trimmed<'a>(value: &'a str, message: &str) -> Result<&'a str, GitError> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(GitError::Parse(message.to_string()));
+    }
+
+    Ok(trimmed)
+}
+
+fn first_non_empty_stdout_line(output: &CommandOutput, message: &str) -> Result<String, GitError> {
+    output
+        .stdout
+        .lines()
+        .next()
+        .and_then(|line| {
+            let trimmed = line.trim();
+            (!trimmed.is_empty()).then_some(trimmed.to_string())
+        })
+        .ok_or_else(|| GitError::Parse(message.to_string()))
+}
+
 fn run_git_checked(
     runner: &dyn CommandRunner,
     args: &[&str],
@@ -411,64 +412,14 @@ fn run_git(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::VecDeque;
+    use crate::test_support::{RecordingRunner, output};
     use std::path::Path;
-    use std::sync::Mutex;
-
-    use anyhow::anyhow;
-
-    use crate::command_runner::{CommandOutput, CommandRunner};
 
     use super::*;
 
-    #[derive(Default)]
-    struct QueueRunner {
-        outputs: Mutex<VecDeque<anyhow::Result<CommandOutput>>>,
-    }
-
-    impl QueueRunner {
-        fn new(outputs: Vec<anyhow::Result<CommandOutput>>) -> Self {
-            Self {
-                outputs: Mutex::new(outputs.into()),
-            }
-        }
-    }
-
-    impl CommandRunner for QueueRunner {
-        fn run(
-            &self,
-            _program: &str,
-            _args: &[&str],
-            _cwd: Option<&Path>,
-        ) -> anyhow::Result<CommandOutput> {
-            self.outputs
-                .lock()
-                .expect("lock")
-                .pop_front()
-                .unwrap_or_else(|| Err(anyhow!("missing output")))
-        }
-
-        fn run_interactive(
-            &self,
-            _program: &str,
-            _args: &[&str],
-            _cwd: Option<&Path>,
-        ) -> anyhow::Result<i32> {
-            Err(anyhow!("interactive command not expected in this test"))
-        }
-    }
-
-    fn output(stdout: &str, stderr: &str, status_code: i32) -> anyhow::Result<CommandOutput> {
-        Ok(CommandOutput {
-            status_code,
-            stdout: stdout.to_string(),
-            stderr: stderr.to_string(),
-        })
-    }
-
     #[test]
     fn query_branches_applies_source_labels() {
-        let runner = QueueRunner::new(vec![
+        let runner = RecordingRunner::from_outputs(vec![
             output("main\nfeature\n", "", 0),
             output("origin/main\norigin/feature\n", "", 0),
         ]);
@@ -482,7 +433,7 @@ mod tests {
 
     #[test]
     fn query_commits_returns_latest_list() {
-        let runner = QueueRunner::new(vec![output(
+        let runner = RecordingRunner::from_outputs(vec![output(
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u{1f}aaaaaaa\u{1f}first\n",
             "",
             0,
@@ -496,7 +447,7 @@ mod tests {
 
     #[test]
     fn query_commits_filters_search_results_and_limits_output() {
-        let runner = QueueRunner::new(vec![output(
+        let runner = RecordingRunner::from_outputs(vec![output(
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u{1f}aaaaaaa\u{1f}first\nbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\u{1f}bbbbbbb\u{1f}second\naaaabbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\u{1f}aaaabbb\u{1f}third\n",
             "",
             0,
@@ -511,7 +462,7 @@ mod tests {
 
     #[test]
     fn query_commits_returns_empty_when_history_is_empty() {
-        let runner = QueueRunner::new(vec![output(
+        let runner = RecordingRunner::from_outputs(vec![output(
             "",
             "fatal: your current branch 'main' does not have any commits yet",
             128,
@@ -523,7 +474,7 @@ mod tests {
 
     #[test]
     fn resolve_current_start_point_returns_no_commits_error() {
-        let runner = QueueRunner::new(vec![output(
+        let runner = RecordingRunner::from_outputs(vec![output(
             "",
             "fatal: ambiguous argument 'HEAD': unknown revision",
             128,
@@ -535,14 +486,14 @@ mod tests {
 
     #[test]
     fn current_branch_reads_head_name() {
-        let runner = QueueRunner::new(vec![output("feature-1\n", "", 0)]);
+        let runner = RecordingRunner::from_outputs(vec![output("feature-1\n", "", 0)]);
         let branch = current_branch(Path::new("."), &runner).expect("branch");
         assert_eq!(branch, "feature-1");
     }
 
     #[test]
     fn delete_branch_safe_reports_not_fully_merged() {
-        let runner = QueueRunner::new(vec![output(
+        let runner = RecordingRunner::from_outputs(vec![output(
             "",
             "error: the branch 'feature-1' is not fully merged.",
             1,
@@ -556,14 +507,14 @@ mod tests {
 
     #[test]
     fn force_remove_worktree_uses_force_flag() {
-        let runner = QueueRunner::new(vec![output("", "", 0)]);
+        let runner = RecordingRunner::from_outputs(vec![output("", "", 0)]);
         let result = force_remove_worktree(Path::new("."), Path::new("./worktrees/w1"), &runner);
         assert!(result.is_ok());
     }
 
     #[test]
     fn force_delete_branch_uses_capital_d() {
-        let runner = QueueRunner::new(vec![output("", "", 0)]);
+        let runner = RecordingRunner::from_outputs(vec![output("", "", 0)]);
         let result = force_delete_branch(Path::new("."), "feature-1", &runner);
         assert!(result.is_ok());
     }

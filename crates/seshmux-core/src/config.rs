@@ -25,6 +25,52 @@ pub struct WindowSpec {
     pub command: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WindowLaunch {
+    Direct { program: String, args: Vec<String> },
+    Shell { shell: Vec<String>, command: String },
+}
+
+impl WindowLaunch {
+    pub fn executable(&self) -> &str {
+        match self {
+            Self::Direct { program, .. } => program.as_str(),
+            Self::Shell { shell, .. } => shell[0].as_str(),
+        }
+    }
+
+    pub fn executable_label(&self) -> &'static str {
+        match self {
+            Self::Direct { .. } => "program",
+            Self::Shell { .. } => "shell",
+        }
+    }
+
+    pub fn into_command_parts(self) -> Vec<String> {
+        match self {
+            Self::Direct { program, args } => {
+                let mut parts = vec![program];
+                parts.extend(args);
+                parts
+            }
+            Self::Shell { mut shell, command } => {
+                shell.push(command);
+                shell
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowLaunchParseError {
+    MixedModes,
+    MissingMode,
+    MissingProgram,
+    MissingShell,
+    MissingShellExecutable,
+    MissingCommand,
+}
+
 #[derive(Debug, Error)]
 pub enum ConfigError {
     #[error("could not resolve home directory for config path")]
@@ -69,6 +115,45 @@ pub fn load_config(path: &Path) -> Result<SeshmuxConfig, ConfigError> {
     Ok(parsed)
 }
 
+pub fn parse_window_launch(window: &WindowSpec) -> Result<WindowLaunch, WindowLaunchParseError> {
+    let direct_mode_selected = window.program.is_some() || window.args.is_some();
+    let shell_mode_selected = window.shell.is_some() || window.command.is_some();
+
+    if direct_mode_selected && shell_mode_selected {
+        return Err(WindowLaunchParseError::MixedModes);
+    }
+
+    if !direct_mode_selected && !shell_mode_selected {
+        return Err(WindowLaunchParseError::MissingMode);
+    }
+
+    if direct_mode_selected {
+        let program = window
+            .program
+            .clone()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or(WindowLaunchParseError::MissingProgram)?;
+        let args = window.args.clone().unwrap_or_default();
+        return Ok(WindowLaunch::Direct { program, args });
+    }
+
+    let shell = window
+        .shell
+        .clone()
+        .ok_or(WindowLaunchParseError::MissingShell)?;
+    if shell.is_empty() || shell[0].trim().is_empty() {
+        return Err(WindowLaunchParseError::MissingShellExecutable);
+    }
+
+    let command = window
+        .command
+        .clone()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or(WindowLaunchParseError::MissingCommand)?;
+
+    Ok(WindowLaunch::Shell { shell, command })
+}
+
 pub fn validate_config(config: &SeshmuxConfig) -> Result<(), ConfigError> {
     if config.version != 1 {
         return Err(ConfigError::Validation {
@@ -89,78 +174,29 @@ pub fn validate_config(config: &SeshmuxConfig) -> Result<(), ConfigError> {
             });
         }
 
-        let direct_mode_selected = window.program.is_some() || window.args.is_some();
-        let shell_mode_selected = window.shell.is_some() || window.command.is_some();
-
-        if direct_mode_selected && shell_mode_selected {
-            return Err(ConfigError::Validation {
-                message: format!(
+        if let Err(error) = parse_window_launch(window) {
+            let message = match error {
+                WindowLaunchParseError::MixedModes => format!(
                     "window[{index}] must use exactly one launch mode (direct or shell), not both"
                 ),
-            });
-        }
-
-        if !direct_mode_selected && !shell_mode_selected {
-            return Err(ConfigError::Validation {
-                message: format!(
+                WindowLaunchParseError::MissingMode => format!(
                     "window[{index}] must define either direct mode (program/args) or shell mode (shell/command)"
                 ),
-            });
-        }
+                WindowLaunchParseError::MissingProgram => {
+                    format!("window[{index}] direct mode requires non-empty program")
+                }
+                WindowLaunchParseError::MissingShell => {
+                    format!("window[{index}] shell mode requires shell field")
+                }
+                WindowLaunchParseError::MissingShellExecutable => {
+                    format!("window[{index}] shell mode requires shell[0] executable")
+                }
+                WindowLaunchParseError::MissingCommand => {
+                    format!("window[{index}] shell mode requires non-empty command")
+                }
+            };
 
-        if direct_mode_selected {
-            if window
-                .program
-                .as_ref()
-                .map(|value| value.trim().is_empty())
-                .unwrap_or(true)
-            {
-                return Err(ConfigError::Validation {
-                    message: format!("window[{index}] direct mode requires non-empty program"),
-                });
-            }
-
-            if window.shell.is_some() || window.command.is_some() {
-                return Err(ConfigError::Validation {
-                    message: format!(
-                        "window[{index}] direct mode cannot include shell or command fields"
-                    ),
-                });
-            }
-        }
-
-        if shell_mode_selected {
-            let shell = window
-                .shell
-                .as_ref()
-                .ok_or_else(|| ConfigError::Validation {
-                    message: format!("window[{index}] shell mode requires shell field"),
-                })?;
-
-            if shell.is_empty() || shell[0].trim().is_empty() {
-                return Err(ConfigError::Validation {
-                    message: format!("window[{index}] shell mode requires shell[0] executable"),
-                });
-            }
-
-            if window
-                .command
-                .as_ref()
-                .map(|value| value.trim().is_empty())
-                .unwrap_or(true)
-            {
-                return Err(ConfigError::Validation {
-                    message: format!("window[{index}] shell mode requires non-empty command"),
-                });
-            }
-
-            if window.program.is_some() || window.args.is_some() {
-                return Err(ConfigError::Validation {
-                    message: format!(
-                        "window[{index}] shell mode cannot include program or args fields"
-                    ),
-                });
-            }
+            return Err(ConfigError::Validation { message });
         }
     }
 
