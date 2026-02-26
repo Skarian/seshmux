@@ -1,5 +1,3 @@
-# seshmux
-
 <div align="center">
 <pre>
 ╔════════════════════════════════════════════════════════════════╗
@@ -14,7 +12,7 @@
 </pre>
 </div>
 
-`seshmux` is a rust tui for managing git worktrees with dedicated tmux sessions
+<p align="center"><code>seshmux</code> is a rust tui for managing git worktrees with dedicated tmux sessions</p>
 
 ## Features
 
