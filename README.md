@@ -1,6 +1,29 @@
 # seshmux
 
+<div align="center">
+<pre>
+╔════════════════════════════════════════════════════════════════╗
+║  ███████╗███████╗███████╗██╗  ██╗███╗   ███╗██╗   ██╗██╗  ██╗  ║
+║  ██╔════╝██╔════╝██╔════╝██║  ██║████╗ ████║██║   ██║╚██╗██╔╝  ║
+║  ███████╗█████╗  ███████╗███████║██╔████╔██║██║   ██║ ╚███╔╝   ║
+║  ╚════██║██╔══╝  ╚════██║██╔══██║██║╚██╔╝██║██║   ██║ ██╔██╗   ║
+║  ███████║███████╗███████║██║  ██║██║ ╚═╝ ██║╚██████╔╝██╔╝ ██╗  ║
+║  ╚══════╝╚══════╝╚══════╝╚═╝  ╚═╝╚═╝     ╚═╝ ╚═════╝ ╚═╝  ╚═╝  ║
+║             TUI for git worktrees + tmux sessions              ║
+╚════════════════════════════════════════════════════════════════╝
+</pre>
+</div>
+
 `seshmux` is a rust tui for managing git worktrees with dedicated tmux sessions
+
+## Features
+
+- Manage Git worktrees from one TUI
+- Create a tmux session per worktree as needed
+- Carry selected untracked/gitignored files into new worktrees
+- Attach to or create worktree sessions from the TUI
+- Define per-window programs via config
+- Vim-style keybindings
 
 ## Requirements
 
@@ -104,6 +127,5 @@ command = "pnpm dev"
 
 - `seshmux` opens the interactive TUI (`new`, `list`, `attach`, `delete`)
 - `seshmux doctor` runs environment/config checks
-- `seshmux --diagnostics` (or `seshmux --diagnostics doctor`) writes logs to `~/.config/seshmux/diagnostics/<timestamp>.log`
+- `seshmux --diagnostics` writes logs to `~/.config/seshmux/diagnostics/<timestamp>.log`
 - `seshmux --help`
-- `seshmux doctor --help`
