@@ -2,6 +2,7 @@ use crossterm::event::{Event, KeyEvent};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Margin, Rect};
 use ratatui::style::Style;
+use ratatui::text::Line;
 use ratatui::widgets::{
     Paragraph, Row, Scrollbar, ScrollbarOrientation, ScrollbarState, Table, TableState,
 };
@@ -15,9 +16,9 @@ pub(crate) struct TableColumn {
     pub(crate) width: Constraint,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(crate) struct WorktreeTableRender<'a> {
-    pub(crate) title: &'a str,
+    pub(crate) title: Line<'a>,
     pub(crate) empty_message: &'a str,
     pub(crate) columns: &'a [TableColumn],
     pub(crate) header_style: Style,
@@ -89,7 +90,7 @@ impl WorktreeTableState {
         &self,
         frame: &mut Frame<'_>,
         area: Rect,
-        title: &str,
+        title: Line<'_>,
         show_cursor: bool,
     ) {
         let width = area.width.saturating_sub(2) as usize;
@@ -118,8 +119,8 @@ impl WorktreeTableState {
         F: Fn(&WorktreeRow) -> Vec<String>,
     {
         if self.filtered.is_empty() {
-            let empty =
-                Paragraph::new(render.empty_message).block(crate::theme::chrome(render.title));
+            let empty = Paragraph::new(render.empty_message)
+                .block(crate::theme::chrome(render.title.clone()));
             frame.render_widget(empty, area);
             return;
         }

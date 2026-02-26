@@ -53,9 +53,7 @@ enum Step {
     NameInput,
     StartPointMode,
     BranchPicker,
-    BranchSearchInput,
     CommitPicker,
-    CommitSearchInput,
     ExtrasPicker,
     ConnectNow,
     Review,
@@ -75,8 +73,10 @@ struct NewFlow {
     start_point: Option<NewStartPoint>,
     branch_picker: Option<PickerState<BranchRef>>,
     branch_search_input: Input,
+    branch_filter_focused: bool,
     commit_picker: Option<PickerState<CommitRef>>,
     commit_search_input: Input,
+    commit_filter_focused: bool,
     extras: ExtrasState,
     connect_choice: BinaryChoice,
     success: Option<NewResult>,
@@ -141,8 +141,10 @@ impl NewFlow {
             start_point: None,
             branch_picker: None,
             branch_search_input: Input::default(),
+            branch_filter_focused: false,
             commit_picker: None,
             commit_search_input: Input::default(),
+            commit_filter_focused: false,
             extras,
             connect_choice: BinaryChoice::new(true),
             success: None,
@@ -258,6 +260,22 @@ mod tests {
         format!("{}", terminal.backend())
     }
 
+    fn advance_to_review(flow: &mut NewFlow, ops: &FakeOps) {
+        flow.on_key(key(KeyCode::Enter), ops).expect("gitignore");
+        for character in "test".chars() {
+            flow.on_key(key(KeyCode::Char(character)), ops)
+                .expect("name");
+        }
+        flow.on_key(key(KeyCode::Enter), ops).expect("name enter");
+        flow.on_key(key(KeyCode::Enter), ops)
+            .expect("start current branch");
+        flow.on_key(key(KeyCode::Enter), ops)
+            .expect("extras continue");
+        flow.on_key(key(KeyCode::Enter), ops)
+            .expect("connect continue");
+        assert_eq!(flow.step, Step::Review);
+    }
+
     #[test]
     fn esc_on_first_step_exits_flow() {
         let temp = tempfile::tempdir().expect("temp dir");
@@ -288,7 +306,7 @@ mod tests {
     }
 
     #[test]
-    fn commit_picker_shows_latest_then_search_results() {
+    fn commit_picker_filters_in_place() {
         let temp = tempfile::tempdir().expect("temp dir");
         let repo_root = temp.path().join("repo");
         std::fs::create_dir_all(&repo_root).expect("repo");
@@ -320,16 +338,14 @@ mod tests {
             "aaaaaaa"
         );
 
-        flow.on_key(key(KeyCode::Enter), &ops).expect("open search");
-        assert_eq!(flow.step, Step::CommitSearchInput);
-
+        flow.on_key(key(KeyCode::Char('/')), &ops)
+            .expect("focus commit filter");
         for character in "bbb".chars() {
             flow.on_key(key(KeyCode::Char(character)), &ops)
                 .expect("type search");
         }
-        flow.on_key(key(KeyCode::Enter), &ops)
-            .expect("apply search");
-        assert_eq!(flow.step, Step::CommitPicker);
+        flow.on_key(key(KeyCode::Char('/')), &ops)
+            .expect("return to commit list");
         assert_eq!(
             flow.commit_picker
                 .as_ref()
@@ -375,8 +391,8 @@ mod tests {
             flow.on_key(key(KeyCode::Char(character)), &ops)
                 .expect("type filter");
         }
-        flow.on_key(key(KeyCode::Enter), &ops)
-            .expect("finish filter");
+        flow.on_key(key(KeyCode::Char('/')), &ops)
+            .expect("return to extras list");
 
         let after = flow.extras.selected_for_copy();
         assert_eq!(before, after);
@@ -404,19 +420,12 @@ mod tests {
             .expect("open branch picker");
         assert_eq!(flow.step, Step::BranchPicker);
 
-        flow.on_key(key(KeyCode::Enter), &ops)
-            .expect("open branch search input");
-        assert_eq!(flow.step, Step::BranchSearchInput);
+        flow.on_key(key(KeyCode::Char('/')), &ops)
+            .expect("focus branch filter");
         flow.on_key(key(KeyCode::Char('x')), &ops)
             .expect("search char");
-        flow.on_key(key(KeyCode::Enter), &ops)
-            .expect("apply empty search");
-        assert_eq!(flow.step, Step::BranchPicker);
-
-        flow.on_key(key(KeyCode::Down), &ops)
-            .expect("select show-all action");
-        flow.on_key(key(KeyCode::Enter), &ops)
-            .expect("show-all action");
+        flow.on_key(key(KeyCode::Char('/')), &ops)
+            .expect("return to branch list");
         assert_eq!(flow.step, Step::BranchPicker);
         assert!(flow.start_point.is_none());
     }
@@ -448,8 +457,8 @@ mod tests {
             flow.on_key(key(KeyCode::Char(character)), &ops)
                 .expect("type unmatched filter");
         }
-        flow.on_key(key(KeyCode::Enter), &ops)
-            .expect("finish filter");
+        flow.on_key(key(KeyCode::Char('/')), &ops)
+            .expect("return to extras list");
         assert!(flow.extras.visible.is_empty());
 
         flow.on_key(key(KeyCode::Char(' ')), &ops)
@@ -516,6 +525,140 @@ mod tests {
         assert_eq!(calls[0].worktree_name, "feature1");
         assert_eq!(calls[0].start_point, NewStartPoint::CurrentBranch);
         assert!(!calls[0].connect_now);
+    }
+
+    #[test]
+    fn success_screen_keys_follow_home_and_quit_contract() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let repo_root = temp.path().join("repo");
+        std::fs::create_dir_all(&repo_root).expect("repo");
+        let ops = FakeOps::new(repo_root.clone());
+
+        let mut enter_flow = NewFlow::new(&ops, &repo_root).expect("flow");
+        enter_flow.step = Step::Success;
+        let enter_signal = enter_flow.on_key(key(KeyCode::Enter), &ops).expect("enter");
+        assert_eq!(enter_signal, FlowSignal::Exit(super::UiExit::BackAtRoot));
+
+        let mut esc_flow = NewFlow::new(&ops, &repo_root).expect("flow");
+        esc_flow.step = Step::Success;
+        let esc_signal = esc_flow.on_key(key(KeyCode::Esc), &ops).expect("esc");
+        assert_eq!(esc_signal, FlowSignal::Exit(super::UiExit::BackAtRoot));
+
+        let mut quit_flow = NewFlow::new(&ops, &repo_root).expect("flow");
+        quit_flow.step = Step::Success;
+        let quit_signal = quit_flow
+            .on_key(key(KeyCode::Char('q')), &ops)
+            .expect("quit");
+        assert_eq!(quit_signal, FlowSignal::Exit(super::UiExit::Completed));
+    }
+
+    #[test]
+    fn review_screen_uses_untracked_gitignored_label() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let repo_root = temp.path().join("repo");
+        std::fs::create_dir_all(&repo_root).expect("repo");
+        let ops = FakeOps::new(repo_root.clone());
+
+        let mut flow = NewFlow::new(&ops, &repo_root).expect("flow");
+        advance_to_review(&mut flow, &ops);
+
+        let output = render_output(&flow, 120, 30);
+        assert!(output.contains("Untracked / gitignored files selected"));
+    }
+
+    #[test]
+    fn connect_now_title_uses_question_wording() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let repo_root = temp.path().join("repo");
+        std::fs::create_dir_all(&repo_root).expect("repo");
+        let ops = FakeOps::new(repo_root.clone());
+
+        let mut flow = NewFlow::new(&ops, &repo_root).expect("flow");
+        flow.step = Step::ConnectNow;
+
+        let output = render_output(&flow, 120, 24);
+        assert!(output.contains("Attach to the tmux session now?"));
+        assert!(!output.contains("Want to attach to the tmux session now"));
+    }
+
+    #[test]
+    fn review_screen_uses_confirm_title_without_duplicate_body_line() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let repo_root = temp.path().join("repo");
+        std::fs::create_dir_all(&repo_root).expect("repo");
+        let ops = FakeOps::new(repo_root.clone());
+
+        let mut flow = NewFlow::new(&ops, &repo_root).expect("flow");
+        advance_to_review(&mut flow, &ops);
+
+        let output = render_output(&flow, 120, 30);
+        assert!(output.contains("Confirm settings before creating the worktree"));
+        assert!(!output.contains("Review settings before creating the worktree"));
+    }
+
+    #[test]
+    fn gitignore_step_uses_back_copy_consistently() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let repo_root = temp.path().join("repo");
+        std::fs::create_dir_all(&repo_root).expect("repo");
+        let ops = FakeOps::new(repo_root.clone());
+
+        let flow = NewFlow::new(&ops, &repo_root).expect("flow");
+        assert_eq!(flow.step, Step::GitignoreDecision);
+
+        let output = render_output(&flow, 120, 24);
+        assert!(output.contains("Esc: back"));
+        assert!(!output.contains("Esc: exit flow"));
+    }
+
+    #[test]
+    fn success_screen_uses_tmux_labels_and_quit_footer() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let repo_root = temp.path().join("repo");
+        std::fs::create_dir_all(&repo_root).expect("repo");
+        let ops = FakeOps::new(repo_root.clone());
+
+        let mut flow = NewFlow::new(&ops, &repo_root).expect("flow");
+        flow.step = Step::Success;
+        flow.success = Some(NewResult {
+            repo_root: repo_root.clone(),
+            worktrees_dir: repo_root.join("worktrees"),
+            worktree_path: repo_root.join("worktrees").join("w1"),
+            branch_name: "w1".to_string(),
+            session_name: "repo/w1".to_string(),
+            attach_command: "tmux attach-session -t repo/w1".to_string(),
+            connected_now: false,
+        });
+
+        let output = render_output(&flow, 120, 30);
+        assert!(output.contains("tmux session name"));
+        assert!(output.contains("Connected in this terminal: No"));
+        assert!(output.contains("q: quit seshmux"));
+    }
+
+    #[test]
+    fn error_screen_footer_matches_behavior_contract() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let repo_root = temp.path().join("repo");
+        std::fs::create_dir_all(&repo_root).expect("repo");
+        let ops = FakeOps::new(repo_root.clone());
+
+        let mut flow = NewFlow::new(&ops, &repo_root).expect("flow");
+        flow.step = Step::ErrorScreen;
+        flow.error_message = Some("create failed".to_string());
+
+        let output = render_output(&flow, 120, 24);
+        assert!(output.contains("Enter/Esc: back"));
+        assert!(!output.contains("q: quit"));
+
+        let enter_signal = flow.on_key(key(KeyCode::Enter), &ops).expect("enter");
+        assert_eq!(enter_signal, FlowSignal::Continue);
+        assert_eq!(flow.step, Step::Review);
+
+        flow.step = Step::ErrorScreen;
+        let quit_signal = flow.on_key(key(KeyCode::Char('q')), &ops).expect("quit");
+        assert_eq!(quit_signal, FlowSignal::Continue);
+        assert_eq!(flow.step, Step::ErrorScreen);
     }
 
     #[test]

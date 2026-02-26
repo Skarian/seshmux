@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use crossterm::event::{Event, KeyEvent};
+use crossterm::event::{Event, KeyCode, KeyEvent};
 use tui_input::backend::crossterm::EventHandler;
 
 use crate::UiExit;
@@ -10,53 +10,6 @@ use super::picker::{PickerAction, PickerState};
 use super::{FlowSignal, NewFlow, NewFlowOps, Step};
 use seshmux_app::{NewRequest, NewStartPoint};
 
-enum PickerInputEvent {
-    Back,
-    Continue,
-    Enter(PickerAction),
-}
-
-enum SearchInputEvent {
-    Back,
-    Continue,
-    Submit(String),
-}
-
-fn handle_picker_input<T>(picker: &mut PickerState<T>, key: KeyEvent) -> PickerInputEvent {
-    if keymap::is_back(key) {
-        return PickerInputEvent::Back;
-    }
-
-    if keymap::is_up(key) {
-        picker.move_up();
-        return PickerInputEvent::Continue;
-    }
-
-    if keymap::is_down(key) {
-        picker.move_down();
-        return PickerInputEvent::Continue;
-    }
-
-    if keymap::is_confirm(key) {
-        return PickerInputEvent::Enter(picker.on_enter());
-    }
-
-    PickerInputEvent::Continue
-}
-
-fn handle_search_input(input: &mut tui_input::Input, key: KeyEvent) -> SearchInputEvent {
-    if keymap::is_back(key) {
-        return SearchInputEvent::Back;
-    }
-
-    if keymap::is_confirm(key) {
-        return SearchInputEvent::Submit(input.value().trim().to_string());
-    }
-
-    let _ = input.handle_event(&Event::Key(key));
-    SearchInputEvent::Continue
-}
-
 impl NewFlow {
     pub(super) fn on_key(&mut self, key: KeyEvent, ops: &dyn NewFlowOps) -> Result<FlowSignal> {
         match self.step {
@@ -64,9 +17,7 @@ impl NewFlow {
             Step::NameInput => self.on_key_name(key),
             Step::StartPointMode => self.on_key_start_mode(key, ops),
             Step::BranchPicker => self.on_key_branch_picker(key, ops),
-            Step::BranchSearchInput => self.on_key_branch_search_input(key, ops),
             Step::CommitPicker => self.on_key_commit_picker(key, ops),
-            Step::CommitSearchInput => self.on_key_commit_search_input(key, ops),
             Step::ExtrasPicker => self.on_key_extras(key),
             Step::ConnectNow => self.on_key_connect_now(key),
             Step::Review => self.on_key_review(key, ops),
@@ -142,11 +93,15 @@ impl NewFlow {
                     self.step = Step::ExtrasPicker;
                 }
                 1 => {
-                    self.branch_picker = Some(self.load_branches(ops, "")?);
+                    let query = self.branch_search_input.value().trim().to_string();
+                    self.branch_picker = Some(self.load_branches(ops, &query)?);
+                    self.branch_filter_focused = false;
                     self.step = Step::BranchPicker;
                 }
                 _ => {
-                    self.commit_picker = Some(self.load_commits(ops, "")?);
+                    let query = self.commit_search_input.value().trim().to_string();
+                    self.commit_picker = Some(self.load_commits(ops, &query)?);
+                    self.commit_filter_focused = false;
                     self.step = Step::CommitPicker;
                 }
             }
@@ -156,149 +111,121 @@ impl NewFlow {
     }
 
     fn on_key_branch_picker(&mut self, key: KeyEvent, ops: &dyn NewFlowOps) -> Result<FlowSignal> {
-        let picker = self.branch_picker.take();
-        let (signal, picker) = self.on_key_picker_generic(
-            key,
-            ops,
-            picker,
-            |flow, ops, query| flow.load_branches(ops, query),
-            |flow, query| {
-                flow.branch_search_input = tui_input::Input::new(query);
-                flow.step = Step::BranchSearchInput;
-            },
-            |flow, branch: &seshmux_core::git::BranchRef| {
-                flow.start_point = Some(NewStartPoint::Branch(branch.name.clone()));
-                flow.step = Step::ExtrasPicker;
-            },
-        )?;
-        self.branch_picker = picker;
-        Ok(signal)
-    }
+        if keymap::is_back(key) {
+            self.branch_filter_focused = false;
+            self.step = Step::StartPointMode;
+            return Ok(FlowSignal::Continue);
+        }
 
-    fn on_key_branch_search_input(
-        &mut self,
-        key: KeyEvent,
-        ops: &dyn NewFlowOps,
-    ) -> Result<FlowSignal> {
-        let mut input = std::mem::take(&mut self.branch_search_input);
-        let signal = self.on_key_search_input_generic(
-            key,
-            ops,
-            &mut input,
-            Step::BranchPicker,
-            |flow, ops, query| {
-                flow.branch_picker = Some(flow.load_branches(ops, query)?);
-                Ok(())
-            },
-        );
-        self.branch_search_input = input;
-        signal
+        if matches!(key.code, KeyCode::Char('/')) {
+            self.branch_filter_focused = !self.branch_filter_focused;
+            return Ok(FlowSignal::Continue);
+        }
+
+        if self.branch_filter_focused {
+            if self
+                .branch_search_input
+                .handle_event(&Event::Key(key))
+                .is_some()
+            {
+                let query = self.branch_search_input.value().trim().to_string();
+                self.branch_picker = Some(self.load_branches(ops, &query)?);
+            }
+            return Ok(FlowSignal::Continue);
+        }
+
+        if self.branch_picker.is_none() {
+            let query = self.branch_search_input.value().trim().to_string();
+            self.branch_picker = Some(self.load_branches(ops, &query)?);
+        }
+
+        if keymap::is_up(key) {
+            if let Some(picker) = &mut self.branch_picker {
+                picker.move_up();
+            }
+            return Ok(FlowSignal::Continue);
+        }
+
+        if keymap::is_down(key) {
+            if let Some(picker) = &mut self.branch_picker {
+                picker.move_down();
+            }
+            return Ok(FlowSignal::Continue);
+        }
+
+        if keymap::is_confirm(key) {
+            let selection = self.branch_picker.as_ref().and_then(|picker| {
+                if let PickerAction::Pick(index) = picker.on_enter() {
+                    picker.items.get(index).map(|branch| branch.name.clone())
+                } else {
+                    None
+                }
+            });
+            if let Some(branch_name) = selection {
+                self.start_point = Some(NewStartPoint::Branch(branch_name));
+                self.branch_filter_focused = false;
+                self.step = Step::ExtrasPicker;
+            }
+        }
+
+        Ok(FlowSignal::Continue)
     }
 
     fn on_key_commit_picker(&mut self, key: KeyEvent, ops: &dyn NewFlowOps) -> Result<FlowSignal> {
-        let picker = self.commit_picker.take();
-        let (signal, picker) = self.on_key_picker_generic(
-            key,
-            ops,
-            picker,
-            |flow, ops, query| flow.load_commits(ops, query),
-            |flow, query| {
-                flow.commit_search_input = tui_input::Input::new(query);
-                flow.step = Step::CommitSearchInput;
-            },
-            |flow, commit: &seshmux_core::git::CommitRef| {
-                flow.start_point = Some(NewStartPoint::Commit(commit.hash.clone()));
-                flow.step = Step::ExtrasPicker;
-            },
-        )?;
-        self.commit_picker = picker;
-        Ok(signal)
-    }
-
-    fn on_key_commit_search_input(
-        &mut self,
-        key: KeyEvent,
-        ops: &dyn NewFlowOps,
-    ) -> Result<FlowSignal> {
-        let mut input = std::mem::take(&mut self.commit_search_input);
-        let signal = self.on_key_search_input_generic(
-            key,
-            ops,
-            &mut input,
-            Step::CommitPicker,
-            |flow, ops, query| {
-                flow.commit_picker = Some(flow.load_commits(ops, query)?);
-                Ok(())
-            },
-        );
-        self.commit_search_input = input;
-        signal
-    }
-
-    fn on_key_picker_generic<T, FLoad, FOpenSearch, FPick>(
-        &mut self,
-        key: KeyEvent,
-        ops: &dyn NewFlowOps,
-        picker: Option<PickerState<T>>,
-        mut load_picker: FLoad,
-        mut open_search: FOpenSearch,
-        mut pick_item: FPick,
-    ) -> Result<(FlowSignal, Option<PickerState<T>>)>
-    where
-        FLoad: FnMut(&mut Self, &dyn NewFlowOps, &str) -> Result<PickerState<T>>,
-        FOpenSearch: FnMut(&mut Self, String),
-        FPick: FnMut(&mut Self, &T),
-    {
-        let mut picker = match picker {
-            Some(value) => value,
-            None => {
-                return Ok((FlowSignal::Continue, Some(load_picker(self, ops, "")?)));
-            }
-        };
-
-        match handle_picker_input(&mut picker, key) {
-            PickerInputEvent::Back => {
-                self.step = Step::StartPointMode;
-            }
-            PickerInputEvent::Continue => {}
-            PickerInputEvent::Enter(action) => match action {
-                PickerAction::OpenSearch => {
-                    open_search(self, picker.query.clone().unwrap_or_default());
-                }
-                PickerAction::ShowAll => {
-                    return Ok((FlowSignal::Continue, Some(load_picker(self, ops, "")?)));
-                }
-                PickerAction::Pick(index) => {
-                    if let Some(item) = picker.items.get(index) {
-                        pick_item(self, item);
-                    }
-                }
-                PickerAction::Noop => {}
-            },
+        if keymap::is_back(key) {
+            self.commit_filter_focused = false;
+            self.step = Step::StartPointMode;
+            return Ok(FlowSignal::Continue);
         }
 
-        Ok((FlowSignal::Continue, Some(picker)))
-    }
+        if matches!(key.code, KeyCode::Char('/')) {
+            self.commit_filter_focused = !self.commit_filter_focused;
+            return Ok(FlowSignal::Continue);
+        }
 
-    fn on_key_search_input_generic<FLoad>(
-        &mut self,
-        key: KeyEvent,
-        ops: &dyn NewFlowOps,
-        input: &mut tui_input::Input,
-        picker_step: Step,
-        mut load_picker: FLoad,
-    ) -> Result<FlowSignal>
-    where
-        FLoad: FnMut(&mut Self, &dyn NewFlowOps, &str) -> Result<()>,
-    {
-        match handle_search_input(input, key) {
-            SearchInputEvent::Back => {
-                self.step = picker_step;
+        if self.commit_filter_focused {
+            if self
+                .commit_search_input
+                .handle_event(&Event::Key(key))
+                .is_some()
+            {
+                let query = self.commit_search_input.value().trim().to_string();
+                self.commit_picker = Some(self.load_commits(ops, &query)?);
             }
-            SearchInputEvent::Continue => {}
-            SearchInputEvent::Submit(query) => {
-                load_picker(self, ops, &query)?;
-                self.step = picker_step;
+            return Ok(FlowSignal::Continue);
+        }
+
+        if self.commit_picker.is_none() {
+            let query = self.commit_search_input.value().trim().to_string();
+            self.commit_picker = Some(self.load_commits(ops, &query)?);
+        }
+
+        if keymap::is_up(key) {
+            if let Some(picker) = &mut self.commit_picker {
+                picker.move_up();
+            }
+            return Ok(FlowSignal::Continue);
+        }
+
+        if keymap::is_down(key) {
+            if let Some(picker) = &mut self.commit_picker {
+                picker.move_down();
+            }
+            return Ok(FlowSignal::Continue);
+        }
+
+        if keymap::is_confirm(key) {
+            let selection = self.commit_picker.as_ref().and_then(|picker| {
+                if let PickerAction::Pick(index) = picker.on_enter() {
+                    picker.items.get(index).map(|commit| commit.hash.clone())
+                } else {
+                    None
+                }
+            });
+            if let Some(commit_hash) = selection {
+                self.start_point = Some(NewStartPoint::Commit(commit_hash));
+                self.commit_filter_focused = false;
+                self.step = Step::ExtrasPicker;
             }
         }
 
@@ -306,22 +233,26 @@ impl NewFlow {
     }
 
     fn on_key_extras(&mut self, key: KeyEvent) -> Result<FlowSignal> {
-        if self.extras.editing_filter {
-            if keymap::is_back(key) || keymap::is_confirm(key) {
-                self.extras.toggle_filter_editing();
-            } else {
-                self.extras.edit_filter(key);
-            }
-            return Ok(FlowSignal::Continue);
-        }
-
         if keymap::is_back(key) {
+            self.extras.editing_filter = false;
+            self.branch_filter_focused = false;
+            self.commit_filter_focused = false;
             self.step = match self.start_point {
                 Some(NewStartPoint::CurrentBranch) => Step::StartPointMode,
                 Some(NewStartPoint::Branch(_)) => Step::BranchPicker,
                 Some(NewStartPoint::Commit(_)) => Step::CommitPicker,
                 None => Step::StartPointMode,
             };
+            return Ok(FlowSignal::Continue);
+        }
+
+        if matches!(key.code, KeyCode::Char('/')) {
+            self.extras.toggle_filter_editing();
+            return Ok(FlowSignal::Continue);
+        }
+
+        if self.extras.editing_filter {
+            self.extras.edit_filter(key);
             return Ok(FlowSignal::Continue);
         }
 
@@ -347,10 +278,9 @@ impl NewFlow {
         }
 
         match key.code {
-            crossterm::event::KeyCode::Tab => self.extras.toggle_fold_current(),
-            crossterm::event::KeyCode::Char('/') => self.extras.toggle_filter_editing(),
-            crossterm::event::KeyCode::Char('a') => self.extras.select_all(),
-            crossterm::event::KeyCode::Char('n') => self.extras.select_none(),
+            KeyCode::Tab => self.extras.toggle_fold_current(),
+            KeyCode::Char('a') => self.extras.select_all(),
+            KeyCode::Char('n') => self.extras.select_none(),
             _ => {}
         }
 
@@ -409,11 +339,15 @@ impl NewFlow {
     }
 
     fn on_key_success(&mut self, key: KeyEvent) -> Result<FlowSignal> {
-        if keymap::is_back(key) || keymap::is_confirm(key) {
-            Ok(FlowSignal::Exit(UiExit::Completed))
-        } else {
-            Ok(FlowSignal::Continue)
+        if keymap::is_quit(key) {
+            return Ok(FlowSignal::Exit(UiExit::Completed));
         }
+
+        if keymap::is_back(key) || keymap::is_confirm(key) {
+            return Ok(FlowSignal::Exit(UiExit::BackAtRoot));
+        }
+
+        Ok(FlowSignal::Continue)
     }
 
     fn on_key_error(&mut self, key: KeyEvent) -> Result<FlowSignal> {
@@ -433,14 +367,7 @@ impl NewFlow {
         let items = ops
             .query_branches(&self.prepare.repo_root, query)
             .with_context(|| "failed to load branch list".to_string())?;
-        Ok(PickerState::from_items(
-            if query.trim().is_empty() {
-                None
-            } else {
-                Some(query.trim().to_string())
-            },
-            items,
-        ))
+        Ok(PickerState::from_items(items))
     }
 
     fn load_commits(
@@ -451,13 +378,6 @@ impl NewFlow {
         let items = ops
             .query_commits(&self.prepare.repo_root, query, 50)
             .with_context(|| "failed to load commit list".to_string())?;
-        Ok(PickerState::from_items(
-            if query.trim().is_empty() {
-                None
-            } else {
-                Some(query.trim().to_string())
-            },
-            items,
-        ))
+        Ok(PickerState::from_items(items))
     }
 }

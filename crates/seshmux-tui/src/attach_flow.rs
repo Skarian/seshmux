@@ -4,6 +4,7 @@ use anyhow::Result;
 use crossterm::event::KeyEvent;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::Color;
+use ratatui::text::{Line, Text};
 use seshmux_app::{App, AttachError, AttachRequest, AttachResult, ListResult};
 
 use crate::UiExit;
@@ -12,7 +13,10 @@ use crate::theme;
 use crate::ui::binary_choice::{BinaryChoice, BinaryChoiceEvent};
 use crate::ui::modal::{ModalSpec, render_error_modal, render_modal};
 use crate::ui::select_step::{SelectSignal, SelectStepState};
-use crate::ui::text::{compact_hint, wrapped_paragraph};
+use crate::ui::text::{
+    compact_hint, focus_line, highlighted_label_value_line, key_hint_height, key_hint_paragraph,
+    label_value_line, result_footer, yes_no,
+};
 use crate::ui::worktree_table::{TableColumn, WorktreeTableRender};
 
 pub(crate) trait AttachFlowOps {
@@ -186,11 +190,15 @@ impl AttachFlow {
     }
 
     fn on_key_success(&mut self, key: KeyEvent) -> FlowSignal {
-        if keymap::is_back(key) || keymap::is_confirm(key) {
-            FlowSignal::Exit(UiExit::Completed)
-        } else {
-            FlowSignal::Continue
+        if keymap::is_quit(key) {
+            return FlowSignal::Exit(UiExit::Completed);
         }
+
+        if keymap::is_back(key) || keymap::is_confirm(key) {
+            return FlowSignal::Exit(UiExit::BackAtRoot);
+        }
+
+        FlowSignal::Continue
     }
 
     fn on_key_error(&mut self, key: KeyEvent) -> FlowSignal {
@@ -214,20 +222,37 @@ impl AttachFlow {
 
     fn render_select(&self, frame: &mut ratatui::Frame<'_>) {
         let area = frame.area();
+        let key_text = if self.select.filter_focused() {
+            compact_hint(
+                area.width,
+                "Type: filter    Backspace: delete    /: list focus    Esc: back",
+                "Type filter    Backspace delete    /: list    Esc: back",
+                "Type filter | Backspace | / list | Esc back",
+            )
+        } else {
+            compact_hint(
+                area.width,
+                "/: filter focus    Enter: attach    Up/Down or j/k: move    Esc: back",
+                "/: filter    Enter: attach    j/k: move    Esc: back",
+                "/ filter | Enter attach | j/k move | Esc back",
+            )
+        };
+        let footer_height = key_hint_height(area.width, key_text);
         let [filter_area, table_area, footer] = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(3),
                 Constraint::Min(8),
-                Constraint::Length(3),
+                Constraint::Length(footer_height),
             ])
             .areas(area);
 
+        let filter_focused = self.select.filter_focused();
         self.select.render_filter(
             frame,
             filter_area,
-            "Filter (focused)",
-            "Filter (Tab to focus)",
+            focus_line("Filter"),
+            Line::from("Filter (/ to focus)"),
         );
 
         let columns = [
@@ -253,7 +278,11 @@ impl AttachFlow {
             frame,
             table_area,
             WorktreeTableRender {
-                title: "Attach: select worktree",
+                title: if filter_focused {
+                    Line::from("Choose worktree to attach (/ to focus)")
+                } else {
+                    focus_line("Choose worktree to attach")
+                },
                 empty_message: "No matching worktrees.",
                 columns: &columns,
                 header_style: theme::table_header(Color::Yellow),
@@ -274,22 +303,7 @@ impl AttachFlow {
             },
         );
 
-        let key_text = if self.select.filter_focused() {
-            compact_hint(
-                area.width,
-                "Type: filter    Backspace: delete    Tab: list focus    Esc: back",
-                "Type filter    Backspace delete    Tab: list    Esc: back",
-                "Type filter | Backspace | Tab list | Esc back",
-            )
-        } else {
-            compact_hint(
-                area.width,
-                "Tab: filter focus    Enter: attach    Up/Down or j/k: move    Esc: back",
-                "Tab: filter    Enter: attach    j/k: move    Esc: back",
-                "Tab filter | Enter attach | j/k move | Esc back",
-            )
-        };
-        let keys = wrapped_paragraph(key_text).block(theme::key_block());
+        let keys = key_hint_paragraph(key_text).block(theme::key_block());
         frame.render_widget(keys, footer);
     }
 
@@ -298,47 +312,57 @@ impl AttachFlow {
             .pending_worktree_name
             .as_deref()
             .unwrap_or("UNCONFIRMED");
-        let text = format!(
-            "No tmux session found for '{worktree}'.\nWould you like to create one?\n\nSelection: {}\n\nSpace: toggle    Enter: continue    Esc: back",
-            self.missing_choice.selected_label()
-        );
+        let text = Text::from(vec![
+            label_value_line("Worktree", worktree),
+            highlighted_label_value_line("Current Selection", self.missing_choice.selected_label()),
+        ]);
         render_modal(
             frame,
             ModalSpec {
-                title: "Attach",
+                title: "No tmux session was found. Create one now?",
+                title_style: Some(theme::focus_prompt()),
                 body: text,
+                key_hint: Some("Space: toggle    Enter: continue    Esc: back"),
                 width_pct: 70,
-                height_pct: 35,
+                height_pct: 40,
             },
         );
     }
 
     fn render_success(&self, frame: &mut ratatui::Frame<'_>) {
-        let text = self
+        let summary = self
             .success_message
-            .as_deref()
-            .unwrap_or("Attached.\n\nEnter/Esc to return.");
+            .clone()
+            .unwrap_or_else(|| "Attached to tmux session".to_string());
+        let lines: Vec<Line<'static>> = summary
+            .lines()
+            .map(|line| Line::from(line.to_string()))
+            .collect();
         render_modal(
             frame,
             ModalSpec {
                 title: "Success",
-                body: text.to_string(),
+                title_style: Some(theme::success_prompt()),
+                body: Text::from(lines),
+                key_hint: Some(result_footer(frame.area().width)),
                 width_pct: 70,
-                height_pct: 35,
+                height_pct: 40,
             },
         );
     }
 
     fn render_error(&self, frame: &mut ratatui::Frame<'_>) {
-        let text = self.error_message.as_deref().unwrap_or("Attach failed.");
-        render_error_modal(frame, text, 80, 40, "Enter/Esc to return.");
+        let text = self.error_message.as_deref().unwrap_or("Attach failed");
+        render_error_modal(frame, text, 80, 40, "Enter/Esc: back");
     }
 }
 
 fn success_message_for(result: &AttachResult) -> String {
     format!(
-        "Connected to {}.\nSession: {}\nCreated session now: {}\n\nEnter/Esc to return.",
-        result.worktree_name, result.session_name, result.created_session
+        "Attached worktree: {}\ntmux session name: {}\nCreated tmux session now: {}",
+        result.worktree_name,
+        result.session_name,
+        yes_no(result.created_session)
     )
 }
 
@@ -448,7 +472,8 @@ mod tests {
         let ops = FakeOps::new();
         let mut flow = AttachFlow::new(&ops, Path::new("/tmp/repo")).expect("flow");
 
-        flow.on_key(key(KeyCode::Tab), &ops).expect("focus filter");
+        flow.on_key(key(KeyCode::Char('/')), &ops)
+            .expect("focus filter");
         flow.on_key(key(KeyCode::Char('z')), &ops)
             .expect("filter char");
         flow.on_key(key(KeyCode::Char('z')), &ops)
@@ -462,11 +487,12 @@ mod tests {
     }
 
     #[test]
-    fn tab_focus_routes_j_to_filter_without_attach_call() {
+    fn slash_focus_routes_j_to_filter_without_attach_call() {
         let ops = FakeOps::new();
         let mut flow = AttachFlow::new(&ops, Path::new("/tmp/repo")).expect("flow");
 
-        flow.on_key(key(KeyCode::Tab), &ops).expect("focus filter");
+        flow.on_key(key(KeyCode::Char('/')), &ops)
+            .expect("focus filter");
         assert!(flow.select.filter_focused());
 
         flow.on_key(key(KeyCode::Char('j')), &ops)
@@ -494,6 +520,44 @@ mod tests {
         let calls = ops.attach_calls.borrow();
         assert_eq!(calls.len(), 1);
         assert!(!calls[0].create_if_missing);
+    }
+
+    #[test]
+    fn success_screen_keys_follow_home_and_quit_contract() {
+        let ops = FakeOps::new();
+
+        let mut enter_flow = AttachFlow::new(&ops, Path::new("/tmp/repo")).expect("flow");
+        enter_flow.step = Step::Success;
+        let enter_signal = enter_flow.on_key(key(KeyCode::Enter), &ops).expect("enter");
+        assert_eq!(enter_signal, FlowSignal::Exit(super::UiExit::BackAtRoot));
+
+        let mut esc_flow = AttachFlow::new(&ops, Path::new("/tmp/repo")).expect("flow");
+        esc_flow.step = Step::Success;
+        let esc_signal = esc_flow.on_key(key(KeyCode::Esc), &ops).expect("esc");
+        assert_eq!(esc_signal, FlowSignal::Exit(super::UiExit::BackAtRoot));
+
+        let mut quit_flow = AttachFlow::new(&ops, Path::new("/tmp/repo")).expect("flow");
+        quit_flow.step = Step::Success;
+        let quit_signal = quit_flow
+            .on_key(key(KeyCode::Char('q')), &ops)
+            .expect("quit");
+        assert_eq!(quit_signal, FlowSignal::Exit(super::UiExit::Completed));
+    }
+
+    #[test]
+    fn success_screen_uses_tmux_labels_and_quit_footer() {
+        let ops = FakeOps::new();
+        let mut flow = AttachFlow::new(&ops, Path::new("/tmp/repo")).expect("flow");
+        flow.step = Step::Success;
+        flow.success_message = Some(
+            "Attached worktree: w1\ntmux session name: repo/w1\nCreated tmux session now: Yes"
+                .to_string(),
+        );
+
+        let output = render_output(&flow, 110, 22);
+        assert!(output.contains("tmux session name"));
+        assert!(!output.contains("Session:"));
+        assert!(output.contains("q: quit"));
     }
 
     #[test]

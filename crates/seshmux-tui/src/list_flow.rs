@@ -4,12 +4,13 @@ use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::Color;
+use ratatui::text::Line;
 use seshmux_app::{App, ListResult};
 
 use crate::UiExit;
 use crate::theme;
 use crate::ui::select_step::{SelectSignal, SelectStepState};
-use crate::ui::text::{compact_hint, wrapped_paragraph};
+use crate::ui::text::{compact_hint, focus_line, key_hint_height, key_hint_paragraph};
 use crate::ui::worktree_table::{TableColumn, WorktreeTableRender};
 
 pub(crate) trait ListFlowOps {
@@ -87,20 +88,37 @@ impl ListFlow {
 
     fn render(&self, frame: &mut ratatui::Frame<'_>) {
         let area = frame.area();
+        let key_text = if self.select.filter_focused() {
+            compact_hint(
+                area.width,
+                "Type: filter    Backspace: delete    /: list focus    Esc: back",
+                "Type filter    Backspace delete    /: list    Esc: back",
+                "Type filter | Backspace | / list | Esc back",
+            )
+        } else {
+            compact_hint(
+                area.width,
+                "/: filter focus    Up/Down or j/k: move    Enter/r: refresh    Esc: back",
+                "/: filter    j/k: move    Enter/r: refresh    Esc: back",
+                "/ filter | j/k move | Enter refresh | Esc back",
+            )
+        };
+        let footer_height = key_hint_height(area.width, key_text);
         let [filter_area, body, footer] = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(3),
                 Constraint::Min(8),
-                Constraint::Length(3),
+                Constraint::Length(footer_height),
             ])
             .areas(area);
 
+        let filter_focused = self.select.filter_focused();
         self.select.render_filter(
             frame,
             filter_area,
-            "Filter (focused)",
-            "Filter (Tab to focus)",
+            focus_line("Filter"),
+            Line::from("Filter (/ to focus)"),
         );
 
         let columns = [
@@ -130,7 +148,11 @@ impl ListFlow {
             frame,
             body,
             WorktreeTableRender {
-                title: "List: worktrees",
+                title: if filter_focused {
+                    Line::from("Browse worktrees (/ to focus)")
+                } else {
+                    focus_line("Browse worktrees")
+                },
                 empty_message: "No worktrees are registered.",
                 columns: &columns,
                 header_style: theme::table_header(Color::Cyan),
@@ -152,22 +174,7 @@ impl ListFlow {
             },
         );
 
-        let key_text = if self.select.filter_focused() {
-            compact_hint(
-                area.width,
-                "Type: filter    Backspace: delete    Tab: list focus    Esc: back",
-                "Type filter    Backspace delete    Tab: list    Esc: back",
-                "Type filter | Backspace | Tab list | Esc back",
-            )
-        } else {
-            compact_hint(
-                area.width,
-                "Tab: filter focus    Up/Down or j/k: move    Enter/r: refresh    Esc: back",
-                "Tab: filter    j/k: move    Enter/r: refresh    Esc: back",
-                "Tab filter | j/k move | Enter refresh | Esc back",
-            )
-        };
-        let keys = wrapped_paragraph(key_text).block(theme::key_block());
+        let keys = key_hint_paragraph(key_text).block(theme::key_block());
         frame.render_widget(keys, footer);
     }
 }
@@ -178,6 +185,8 @@ mod tests {
 
     use anyhow::Result;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
     use seshmux_app::{ListResult, WorktreeRow};
 
     use super::{FlowSignal, ListFlow, ListFlowOps};
@@ -197,6 +206,15 @@ mod tests {
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn render_output(flow: &ListFlow, width: u16, height: u16) -> String {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| flow.render(frame))
+            .expect("render list flow");
+        format!("{}", terminal.backend())
     }
 
     #[test]
@@ -262,7 +280,7 @@ mod tests {
     }
 
     #[test]
-    fn tab_focus_routes_text_input_to_filter() {
+    fn slash_focus_routes_text_input_to_filter() {
         let ops = FakeOps {
             rows: vec![
                 WorktreeRow {
@@ -285,7 +303,7 @@ mod tests {
         };
         let mut flow = ListFlow::new(&ops, Path::new("/tmp/repo")).expect("flow");
 
-        flow.on_key(key(KeyCode::Tab), &ops, Path::new("/tmp/repo"))
+        flow.on_key(key(KeyCode::Char('/')), &ops, Path::new("/tmp/repo"))
             .expect("focus filter");
         assert!(flow.select.filter_focused());
 
@@ -293,5 +311,15 @@ mod tests {
             .expect("type filter");
         assert_eq!(flow.select.selected(), 0);
         assert_eq!(flow.select.filtered_len(), 0);
+    }
+
+    #[test]
+    fn select_screen_uses_browse_worktrees_title_without_prompt_duplication() {
+        let ops = FakeOps { rows: Vec::new() };
+        let flow = ListFlow::new(&ops, Path::new("/tmp/repo")).expect("flow");
+
+        let output = render_output(&flow, 120, 22);
+        assert!(output.contains("Browse worktrees"));
+        assert!(!output.contains("Browse worktrees and refresh if needed"));
     }
 }

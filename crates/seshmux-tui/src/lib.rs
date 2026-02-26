@@ -24,11 +24,14 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::Color;
+use ratatui::text::{Line, Text};
 use ratatui::widgets::{List, ListItem, ListState};
 use seshmux_app::App;
 
 use crate::ui::modal::render_error_modal;
-use crate::ui::text::{compact_hint, wrapped_paragraph};
+use crate::ui::text::{
+    compact_hint, focus_line, key_hint_height, key_hint_paragraph, wrapped_paragraph,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UiExit {
@@ -56,7 +59,7 @@ impl RootAction {
         match self {
             Self::New => "New worktree",
             Self::List => "List worktrees",
-            Self::Attach => "Attach session",
+            Self::Attach => "Attach to tmux session",
             Self::Delete => "Delete worktree",
         }
     }
@@ -262,20 +265,28 @@ impl RootScreen {
 
     fn render(&self, frame: &mut ratatui::Frame<'_>, cwd: &Path) {
         let area = frame.area();
+        let key_text = compact_hint(
+            area.width,
+            "Enter: select    Up/Down or j/k: move    Esc/q: exit",
+            "Enter: select    j/k: move    Esc/q: exit",
+            "Enter: select | j/k: move | Esc/q: exit",
+        );
+        let footer_height = key_hint_height(area.width, key_text);
         let [header, body, footer] = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(4),
                 Constraint::Min(8),
-                Constraint::Length(4),
+                Constraint::Length(footer_height),
             ])
             .areas(area);
 
-        let title = wrapped_paragraph(format!(
-            "seshmux\n{}\nSelect a workflow",
-            cwd.to_string_lossy()
-        ))
-        .block(theme::chrome("Root"));
+        let header_text = Text::from(vec![
+            Line::from("seshmux"),
+            Line::from(cwd.to_string_lossy().to_string()),
+            focus_line("Choose what you want to do"),
+        ]);
+        let title = wrapped_paragraph(header_text).block(theme::chrome("Home"));
         frame.render_widget(title, header);
 
         let items: Vec<ListItem<'_>> = ROOT_ACTIONS
@@ -283,20 +294,14 @@ impl RootScreen {
             .map(|action| ListItem::new(action.title()))
             .collect();
         let list = List::new(items)
-            .block(theme::chrome("Actions"))
+            .block(theme::chrome(focus_line("Actions")))
             .highlight_style(theme::table_highlight(Color::Cyan));
 
         let mut state = ListState::default();
         state.select(Some(self.selected));
         frame.render_stateful_widget(list, body, &mut state);
 
-        let hints = wrapped_paragraph(compact_hint(
-            area.width,
-            "Enter: select    Up/Down or j/k: move    Esc/q: exit",
-            "Enter: select    j/k: move    Esc/q: exit",
-            "Enter: select | j/k: move | Esc/q: exit",
-        ))
-        .block(theme::key_block());
+        let hints = key_hint_paragraph(key_text).block(theme::key_block());
         frame.render_widget(hints, footer);
     }
 }
@@ -425,7 +430,7 @@ pub fn run_root(app: &App<'_>, cwd: &Path) -> Result<UiExit> {
 
 fn render_global_error(frame: &mut ratatui::Frame<'_>, message: &str) {
     let text = format!("Operation failed.\n\n{message}");
-    render_error_modal(frame, &text, 88, 72, "Enter/Esc to continue.");
+    render_error_modal(frame, &text, 88, 72, "Enter/Esc: continue");
 }
 
 pub(crate) fn centered_rect(

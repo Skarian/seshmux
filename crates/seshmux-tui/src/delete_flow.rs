@@ -4,6 +4,7 @@ use anyhow::Result;
 use crossterm::event::KeyEvent;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::Color;
+use ratatui::text::{Line, Text};
 use seshmux_app::{App, DeleteError, DeleteRequest, DeleteResult, ListResult};
 
 use crate::UiExit;
@@ -14,7 +15,10 @@ use crate::ui::modal::{
     ModalSpec, render_error_modal, render_modal, render_notice_modal, render_success_modal,
 };
 use crate::ui::select_step::{SelectSignal, SelectStepState};
-use crate::ui::text::{compact_hint, wrapped_paragraph};
+use crate::ui::text::{
+    compact_hint, focus_line, highlighted_label_value_line, key_hint_height, key_hint_paragraph,
+    label_value_line, result_footer, yes_no,
+};
 use crate::ui::worktree_table::{TableColumn, WorktreeTableRender};
 
 pub(crate) trait DeleteFlowOps {
@@ -280,7 +284,7 @@ impl DeleteFlow {
                     }
                     Err(error) => {
                         self.success_message = Some(format!(
-                            "Deleted worktree '{}'. Session '{}'. Branch kept (force delete failed: {error:#}).",
+                            "Deleted worktree '{}'. tmux session '{}'. Branch kept (force delete failed: {error:#}).",
                             result.worktree_name, result.session_name
                         ));
                         self.step = Step::Notice;
@@ -293,21 +297,27 @@ impl DeleteFlow {
     }
 
     fn on_key_success(&mut self, key: KeyEvent) -> FlowSignal {
-        if keymap::is_back(key) || keymap::is_confirm(key) {
-            FlowSignal::Exit(UiExit::Completed)
-        } else {
-            FlowSignal::Continue
+        if keymap::is_quit(key) {
+            return FlowSignal::Exit(UiExit::Completed);
         }
+
+        if keymap::is_back(key) || keymap::is_confirm(key) {
+            return FlowSignal::Exit(UiExit::BackAtRoot);
+        }
+
+        FlowSignal::Continue
     }
 
     fn on_key_notice(&mut self, key: KeyEvent) -> FlowSignal {
-        if keymap::is_back(key) || keymap::is_confirm(key) {
-            self.select.set_filter_focused(false);
-            self.step = Step::SelectWorktree;
-            FlowSignal::Continue
-        } else {
-            FlowSignal::Continue
+        if keymap::is_quit(key) {
+            return FlowSignal::Exit(UiExit::Completed);
         }
+
+        if keymap::is_back(key) || keymap::is_confirm(key) {
+            return FlowSignal::Exit(UiExit::BackAtRoot);
+        }
+
+        FlowSignal::Continue
     }
 
     fn on_key_error(&mut self, key: KeyEvent) -> FlowSignal {
@@ -381,7 +391,7 @@ impl DeleteFlow {
         };
 
         format!(
-            "Deleted worktree '{}'. Session '{}'. Branch: {}.",
+            "Deleted worktree '{}'. tmux session '{}'. Branch status: {}.",
             result.worktree_name, result.session_name, branch_summary
         )
     }
@@ -392,7 +402,7 @@ impl DeleteFlow {
             .as_deref()
             .unwrap_or("unknown error");
         format!(
-            "Deleted worktree '{}'. Session '{}'. Branch kept (safe delete failed: {}).",
+            "Deleted worktree '{}'. tmux session '{}'. Branch kept (safe delete failed: {}).",
             result.worktree_name, result.session_name, failure
         )
     }
@@ -433,20 +443,37 @@ impl DeleteFlow {
 
     fn render_select(&self, frame: &mut ratatui::Frame<'_>) {
         let area = frame.area();
+        let key_text = if self.select.filter_focused() {
+            compact_hint(
+                area.width,
+                "Type: filter    Backspace: delete    /: list focus    Esc: back",
+                "Type filter    Backspace delete    /: list    Esc: back",
+                "Type filter | Backspace | / list | Esc back",
+            )
+        } else {
+            compact_hint(
+                area.width,
+                "/: filter focus    Enter: select    Up/Down or j/k: move    Esc: back",
+                "/: filter    Enter: select    j/k: move    Esc: back",
+                "/ filter | Enter select | j/k move | Esc back",
+            )
+        };
+        let footer_height = key_hint_height(area.width, key_text);
         let [filter_area, table_area, footer] = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(3),
                 Constraint::Min(8),
-                Constraint::Length(3),
+                Constraint::Length(footer_height),
             ])
             .areas(area);
 
+        let filter_focused = self.select.filter_focused();
         self.select.render_filter(
             frame,
             filter_area,
-            "Filter (focused)",
-            "Filter (Tab to focus)",
+            focus_line("Filter"),
+            Line::from("Filter (/ to focus)"),
         );
 
         let columns = [
@@ -472,7 +499,11 @@ impl DeleteFlow {
             frame,
             table_area,
             WorktreeTableRender {
-                title: "Delete: select worktree",
+                title: if filter_focused {
+                    Line::from("Choose worktree to delete (/ to focus)")
+                } else {
+                    focus_line("Choose worktree to delete")
+                },
                 empty_message: "No matching worktrees.",
                 columns: &columns,
                 header_style: theme::table_header(Color::Red),
@@ -493,22 +524,7 @@ impl DeleteFlow {
             },
         );
 
-        let key_text = if self.select.filter_focused() {
-            compact_hint(
-                area.width,
-                "Type: filter    Backspace: delete    Tab: list focus    Esc: back",
-                "Type filter    Backspace delete    Tab: list    Esc: back",
-                "Type filter | Backspace | Tab list | Esc back",
-            )
-        } else {
-            compact_hint(
-                area.width,
-                "Tab: filter focus    Enter: select    Up/Down or j/k: move    Esc: back",
-                "Tab: filter    Enter: select    j/k: move    Esc: back",
-                "Tab filter | Enter select | j/k move | Esc back",
-            )
-        };
-        let keys = wrapped_paragraph(key_text).block(theme::key_block());
+        let keys = key_hint_paragraph(key_text).block(theme::key_block());
         frame.render_widget(keys, footer);
     }
 
@@ -538,24 +554,30 @@ impl DeleteFlow {
             ),
         ];
 
-        let mut body = String::new();
-        body.push_str(&format!("Delete options for '{target}':\n\n"));
+        let mut lines = vec![label_value_line("Worktree", target), Line::from("")];
         for (index, (label, value)) in rows.iter().enumerate() {
             let marker = if self.option_selected == index {
                 ">>"
             } else {
                 "  "
             };
-            body.push_str(&format!("{marker} {label}: {value}\n"));
+            let row_line = format!("{marker} {label}: {value}");
+            if self.option_selected == index {
+                lines.push(focus_line(row_line));
+            } else {
+                lines.push(Line::from(row_line));
+            }
         }
-        body.push_str("\nSpace: toggle selected option\n");
-        body.push_str("Up/Down or j/k: move option    Enter: continue    Esc: back");
 
         render_modal(
             frame,
             ModalSpec {
-                title: "Delete",
-                body,
+                title: "Choose delete options for this worktree",
+                title_style: Some(theme::focus_prompt()),
+                body: Text::from(lines),
+                key_hint: Some(
+                    "Space: toggle selected option    Up/Down or j/k: move option    Enter: continue    Esc: back",
+                ),
                 width_pct: 78,
                 height_pct: 56,
             },
@@ -564,27 +586,21 @@ impl DeleteFlow {
 
     fn render_confirm(&self, frame: &mut ratatui::Frame<'_>) {
         let target = self.target_name.as_deref().unwrap_or("UNCONFIRMED");
-        let session_text = if self.options.kill_tmux_session {
-            "Yes"
-        } else {
-            "No"
-        };
-        let delete_branch_text = if self.options.delete_branch {
-            "Yes"
-        } else {
-            "No"
-        };
-
-        let text = format!(
-            "Confirm delete for '{target}':\n\nKill tmux session: {session_text}\nDelete branch: {delete_branch_text}\n\nExecute now? {}\n\nSpace: toggle    Enter: confirm    Esc: back",
-            self.confirm_choice.selected_label()
-        );
+        let text = Text::from(vec![
+            label_value_line("Worktree", target),
+            label_value_line("Kill tmux session", yes_no(self.options.kill_tmux_session)),
+            label_value_line("Delete branch", yes_no(self.options.delete_branch)),
+            Line::from(""),
+            highlighted_label_value_line("Current Selection", self.confirm_choice.selected_label()),
+        ]);
 
         render_modal(
             frame,
             ModalSpec {
-                title: "Confirm",
+                title: "Confirm worktree deletion",
+                title_style: Some(theme::focus_prompt()),
                 body: text,
+                key_hint: Some("Space: toggle    Enter: confirm    Esc: back"),
                 width_pct: 78,
                 height_pct: 48,
             },
@@ -593,15 +609,22 @@ impl DeleteFlow {
 
     fn render_worktree_force_prompt(&self, frame: &mut ratatui::Frame<'_>) {
         let error = self.error_message.as_deref().unwrap_or("unknown error");
-        let text = format!(
-            "Worktree deletion failed due to:\n{error}\n\nWould you like to force deletion?\n\nSelection: {}\n\nSpace: toggle    Enter: continue    Esc: back",
-            self.worktree_force_choice.selected_label()
-        );
+        let text = Text::from(vec![
+            Line::from("Safe delete error:"),
+            Line::from(error.to_string()),
+            Line::from(""),
+            highlighted_label_value_line(
+                "Current Selection",
+                self.worktree_force_choice.selected_label(),
+            ),
+        ]);
         render_modal(
             frame,
             ModalSpec {
-                title: "Force delete worktree",
+                title: "Safe deletion failed. Force delete this worktree?",
+                title_style: Some(theme::focus_prompt()),
                 body: text,
+                key_hint: Some("Space: toggle    Enter: continue    Esc: back"),
                 width_pct: 85,
                 height_pct: 55,
             },
@@ -617,15 +640,23 @@ impl DeleteFlow {
             .and_then(|value| value.branch_delete_error.as_deref())
             .unwrap_or("unknown error");
 
-        let text = format!(
-            "Branch deletion failed due to:\n{error}\n\nForce delete branch '{branch_name}'?\n\nSelection: {}\n\nSpace: toggle    Enter: continue    Esc: back",
-            self.branch_force_choice.selected_label()
-        );
+        let text = Text::from(vec![
+            label_value_line("Branch", branch_name),
+            Line::from("Safe delete error:"),
+            Line::from(error.to_string()),
+            Line::from(""),
+            highlighted_label_value_line(
+                "Current Selection",
+                self.branch_force_choice.selected_label(),
+            ),
+        ]);
         render_modal(
             frame,
             ModalSpec {
-                title: "Force delete branch",
+                title: "Safe branch delete failed. Force delete the branch?",
+                title_style: Some(theme::focus_prompt()),
                 body: text,
+                key_hint: Some("Space: toggle    Enter: continue    Esc: keep branch"),
                 width_pct: 85,
                 height_pct: 55,
             },
@@ -636,21 +667,28 @@ impl DeleteFlow {
         let text = self
             .success_message
             .as_deref()
-            .unwrap_or("Delete completed.");
-        render_success_modal(frame, text, 75, 35, "Enter/Esc to return.");
+            .unwrap_or("Delete completed");
+        render_success_modal(frame, text, 75, 35, result_footer(frame.area().width));
     }
 
     fn render_notice(&self, frame: &mut ratatui::Frame<'_>) {
         let text = self
             .success_message
             .as_deref()
-            .unwrap_or("No changes were made.");
-        render_notice_modal(frame, "Notice", text, 70, 30, "Enter/Esc to continue.");
+            .unwrap_or("No changes were made");
+        render_notice_modal(
+            frame,
+            "Delete notice",
+            text,
+            70,
+            30,
+            result_footer(frame.area().width),
+        );
     }
 
     fn render_error(&self, frame: &mut ratatui::Frame<'_>) {
-        let text = self.error_message.as_deref().unwrap_or("Delete failed.");
-        render_error_modal(frame, text, 80, 40, "Enter/Esc to return.");
+        let text = self.error_message.as_deref().unwrap_or("Delete failed");
+        render_error_modal(frame, text, 80, 40, "Enter/Esc: back");
     }
 }
 
@@ -882,6 +920,37 @@ mod tests {
     }
 
     #[test]
+    fn branch_force_esc_keeps_branch_and_shows_notice() {
+        let ops = FakeOps::new(false, false, true, false);
+        let mut flow = DeleteFlow::new(&ops, Path::new("/tmp/repo")).expect("flow");
+
+        apply_keys(
+            &mut flow,
+            &ops,
+            &[
+                KeyCode::Enter,
+                KeyCode::Down,
+                KeyCode::Char(' '),
+                KeyCode::Enter,
+                KeyCode::Char(' '),
+                KeyCode::Enter,
+            ],
+        );
+        assert_eq!(flow.step, Step::BranchForcePrompt);
+
+        flow.on_key(key(KeyCode::Esc), &ops)
+            .expect("esc keeps branch");
+        assert_eq!(flow.step, Step::Notice);
+        assert!(
+            flow.success_message
+                .as_deref()
+                .unwrap_or("")
+                .contains("Branch kept")
+        );
+        assert!(ops.force_branch_calls.borrow().is_empty());
+    }
+
+    #[test]
     fn branch_force_yes_calls_force_delete_and_succeeds() {
         let ops = FakeOps::new(false, false, true, false);
         let mut flow = DeleteFlow::new(&ops, Path::new("/tmp/repo")).expect("flow");
@@ -923,9 +992,10 @@ mod tests {
         flow.on_key(key(KeyCode::Enter), &ops).expect("confirm no");
         assert_eq!(flow.step, Step::Notice);
 
-        flow.on_key(key(KeyCode::Enter), &ops)
+        let signal = flow
+            .on_key(key(KeyCode::Enter), &ops)
             .expect("close notice");
-        assert_eq!(flow.step, Step::SelectWorktree);
+        assert_eq!(signal, FlowSignal::Exit(super::UiExit::BackAtRoot));
 
         let calls = ops.delete_calls.borrow();
         assert!(calls.is_empty());
@@ -936,7 +1006,8 @@ mod tests {
         let ops = FakeOps::new(false, false, false, false);
         let mut flow = DeleteFlow::new(&ops, Path::new("/tmp/repo")).expect("flow");
 
-        flow.on_key(key(KeyCode::Tab), &ops).expect("focus filter");
+        flow.on_key(key(KeyCode::Char('/')), &ops)
+            .expect("focus filter");
         apply_keys(
             &mut flow,
             &ops,
@@ -950,11 +1021,12 @@ mod tests {
     }
 
     #[test]
-    fn tab_focus_routes_j_to_filter_without_advancing_step() {
+    fn slash_focus_routes_j_to_filter_without_advancing_step() {
         let ops = FakeOps::new(false, false, false, false);
         let mut flow = DeleteFlow::new(&ops, Path::new("/tmp/repo")).expect("flow");
 
-        flow.on_key(key(KeyCode::Tab), &ops).expect("focus filter");
+        flow.on_key(key(KeyCode::Char('/')), &ops)
+            .expect("focus filter");
         assert!(flow.select.filter_focused());
 
         flow.on_key(key(KeyCode::Char('j')), &ops)
@@ -967,12 +1039,11 @@ mod tests {
     }
 
     #[test]
-    fn success_screen_enter_returns_completed_exit() {
+    fn success_screen_keys_follow_home_and_quit_contract() {
         let ops = FakeOps::new(false, false, false, false);
-        let mut flow = DeleteFlow::new(&ops, Path::new("/tmp/repo")).expect("flow");
-
+        let mut enter_flow = DeleteFlow::new(&ops, Path::new("/tmp/repo")).expect("flow");
         apply_keys(
-            &mut flow,
+            &mut enter_flow,
             &ops,
             &[
                 KeyCode::Enter,
@@ -983,19 +1054,71 @@ mod tests {
                 KeyCode::Enter,
             ],
         );
-        assert_eq!(flow.step, Step::Success);
+        assert_eq!(enter_flow.step, Step::Success);
 
-        let signal = flow
-            .on_key(key(KeyCode::Enter), &ops)
-            .expect("exit success");
-        assert_eq!(signal, FlowSignal::Exit(super::UiExit::Completed));
+        let enter_signal = enter_flow.on_key(key(KeyCode::Enter), &ops).expect("enter");
+        assert_eq!(enter_signal, FlowSignal::Exit(super::UiExit::BackAtRoot));
 
-        let calls = ops.delete_calls.borrow();
-        assert_eq!(calls.len(), 1);
+        let mut esc_flow = DeleteFlow::new(&ops, Path::new("/tmp/repo")).expect("flow");
+        apply_keys(
+            &mut esc_flow,
+            &ops,
+            &[
+                KeyCode::Enter,
+                KeyCode::Down,
+                KeyCode::Char(' '),
+                KeyCode::Enter,
+                KeyCode::Char(' '),
+                KeyCode::Enter,
+            ],
+        );
+        assert_eq!(esc_flow.step, Step::Success);
+        let esc_signal = esc_flow.on_key(key(KeyCode::Esc), &ops).expect("esc");
+        assert_eq!(esc_signal, FlowSignal::Exit(super::UiExit::BackAtRoot));
+
+        let mut quit_flow = DeleteFlow::new(&ops, Path::new("/tmp/repo")).expect("flow");
+        apply_keys(
+            &mut quit_flow,
+            &ops,
+            &[
+                KeyCode::Enter,
+                KeyCode::Down,
+                KeyCode::Char(' '),
+                KeyCode::Enter,
+                KeyCode::Char(' '),
+                KeyCode::Enter,
+            ],
+        );
+        assert_eq!(quit_flow.step, Step::Success);
+        let quit_signal = quit_flow
+            .on_key(key(KeyCode::Char('q')), &ops)
+            .expect("quit");
+        assert_eq!(quit_signal, FlowSignal::Exit(super::UiExit::Completed));
     }
 
     #[test]
-    fn notice_modal_wraps_long_message() {
+    fn notice_screen_keys_follow_home_and_quit_contract() {
+        let ops = FakeOps::new(false, false, false, false);
+        let mut enter_flow = DeleteFlow::new(&ops, Path::new("/tmp/repo")).expect("flow");
+        enter_flow.step = Step::Notice;
+        let enter_signal = enter_flow.on_key(key(KeyCode::Enter), &ops).expect("enter");
+        assert_eq!(enter_signal, FlowSignal::Exit(super::UiExit::BackAtRoot));
+
+        let mut esc_flow = DeleteFlow::new(&ops, Path::new("/tmp/repo")).expect("flow");
+        esc_flow.step = Step::Notice;
+        let esc_signal = esc_flow.on_key(key(KeyCode::Esc), &ops).expect("esc");
+        assert_eq!(esc_signal, FlowSignal::Exit(super::UiExit::BackAtRoot));
+
+        let mut quit_flow = DeleteFlow::new(&ops, Path::new("/tmp/repo")).expect("flow");
+        quit_flow.step = Step::Notice;
+        let quit_signal = quit_flow
+            .on_key(key(KeyCode::Char('q')), &ops)
+            .expect("quit");
+        assert_eq!(quit_signal, FlowSignal::Exit(super::UiExit::Completed));
+    }
+
+    #[test]
+    fn notice_modal_wraps_long_message_and_shows_quit_footer() {
         let ops = FakeOps::new(false, false, false, false);
         let mut flow = DeleteFlow::new(&ops, Path::new("/tmp/repo")).expect("flow");
         flow.step = Step::Notice;
@@ -1003,7 +1126,8 @@ mod tests {
             "Deleted worktree but branch remained due to a very long explanatory note that must wrap in the notice modal and keep TOKEN_WRAP_DELETE visible".to_string(),
         );
 
-        let output = render_output(&flow, 60, 20);
+        let output = render_output(&flow, 110, 20);
         assert!(output.contains("TOKEN_WRAP_DELETE"));
+        assert!(output.contains("q: quit"));
     }
 }

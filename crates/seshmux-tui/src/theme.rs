@@ -20,3 +20,23 @@ pub(crate) fn table_highlight(color: Color) -> Style {
         .bg(color)
         .add_modifier(Modifier::BOLD)
 }
+
+pub(crate) fn focus_prompt() -> Style {
+    Style::default()
+        .fg(Color::Blue)
+        .add_modifier(Modifier::BOLD)
+}
+
+pub(crate) fn success_prompt() -> Style {
+    Style::default()
+        .fg(Color::Green)
+        .add_modifier(Modifier::BOLD)
+}
+
+pub(crate) fn error_prompt() -> Style {
+    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+}
+
+pub(crate) fn secondary_text() -> Style {
+    Style::default().fg(Color::Gray).add_modifier(Modifier::DIM)
+}

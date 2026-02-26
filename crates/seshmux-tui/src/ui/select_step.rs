@@ -1,6 +1,7 @@
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::Frame;
 use ratatui::layout::Rect;
+use ratatui::text::Line;
 use seshmux_app::WorktreeRow;
 
 use crate::keymap;
@@ -33,7 +34,7 @@ impl SelectStepState {
             return SelectSignal::Back;
         }
 
-        if matches!(key.code, KeyCode::Tab) {
+        if matches!(key.code, KeyCode::Char('/')) {
             self.filter_focused = !self.filter_focused;
             return SelectSignal::Continue;
         }
@@ -64,8 +65,8 @@ impl SelectStepState {
         &self,
         frame: &mut Frame<'_>,
         area: Rect,
-        focused_title: &str,
-        unfocused_title: &str,
+        focused_title: Line<'_>,
+        unfocused_title: Line<'_>,
     ) {
         let title = if self.filter_focused {
             focused_title
@@ -144,11 +145,14 @@ mod tests {
     }
 
     #[test]
-    fn tab_toggles_focus_and_routes_filter_input() {
+    fn slash_toggles_focus_and_routes_filter_input() {
         let mut state = SelectStepState::new(vec![row("alpha"), row("beta")]);
         assert!(!state.filter_focused());
 
-        assert_eq!(state.on_key(key(KeyCode::Tab)), SelectSignal::Continue);
+        assert_eq!(
+            state.on_key(key(KeyCode::Char('/'))),
+            SelectSignal::Continue
+        );
         assert!(state.filter_focused());
 
         state.on_key(key(KeyCode::Char('b')));
