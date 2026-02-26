@@ -19,17 +19,17 @@
 <table>
   <tr>
     <td align="center" width="50%">
-      <a href="https://raw.githubusercontent.com/Skarian/seshmux/main/demo/output/01-create-and-attach.gif"><img src="demo/output/01-create-and-attach.gif" alt="Create and attach demo" width="100%"></a><br>
+      <a href="https://raw.githubusercontent.com/Skarian/seshmux/main/demo/output/01-create-and-attach.gif" target="_blank" rel="noopener noreferrer"><img src="demo/output/01-create-and-attach.gif" alt="Create and attach demo" width="100%"></a><br>
       <sub>Create worktree + tmux session</sub>
     </td>
     <td align="center" width="50%">
-      <a href="https://raw.githubusercontent.com/Skarian/seshmux/main/demo/output/02-attach-existing.gif"><img src="demo/output/02-attach-existing.gif" alt="Attach existing demo" width="100%"></a><br>
+      <a href="https://raw.githubusercontent.com/Skarian/seshmux/main/demo/output/02-attach-existing.gif" target="_blank" rel="noopener noreferrer"><img src="demo/output/02-attach-existing.gif" alt="Attach existing demo" width="100%"></a><br>
       <sub>Attach to existing tmux session</sub>
     </td>
   </tr>
   <tr>
     <td align="center" colspan="2">
-      <a href="https://raw.githubusercontent.com/Skarian/seshmux/main/demo/output/03-delete-and-kill.gif"><img src="demo/output/03-delete-and-kill.gif" alt="Delete and kill tmux demo" width="70%"></a><br>
+      <a href="https://raw.githubusercontent.com/Skarian/seshmux/main/demo/output/03-delete-and-kill.gif" target="_blank" rel="noopener noreferrer"><img src="demo/output/03-delete-and-kill.gif" alt="Delete and kill tmux demo" width="70%"></a><br>
       <sub>Delete worktree + kill tmux session</sub>
     </td>
   </tr>
