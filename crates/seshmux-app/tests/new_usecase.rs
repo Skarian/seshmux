@@ -44,7 +44,7 @@ fn new_execute_returns_no_commits_error_for_current_branch_start() {
         .expect_err("expected no commits error");
 
     assert!(error.to_string().contains(
-        "repository has no commits yet; create an initial commit or choose a different start point"
+        "current branch/HEAD has no commits yet; create an initial commit on this branch or choose a Branch/Commit start point"
     ));
 }
 

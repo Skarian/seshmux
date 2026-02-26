@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::fs;
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Result, anyhow};
@@ -41,10 +42,20 @@ impl ExtrasState {
                 Ok(path) => path,
                 Err(_) => continue,
             };
+            if is_worktrees_relative_path(&relative) {
+                continue;
+            }
             let absolute = repo_root.join(&relative);
+            let metadata = match fs::symlink_metadata(&absolute) {
+                Ok(metadata) => metadata,
+                Err(_) => continue,
+            };
+            if metadata.file_type().is_symlink() {
+                continue;
+            }
 
             normalized.insert(relative.clone());
-            if absolute.is_dir() {
+            if metadata.is_dir() {
                 expand_directory(repo_root, &absolute, &mut normalized);
             }
         }
@@ -379,7 +390,7 @@ pub(crate) fn identifier_path_for_key(key: &str) -> Vec<String> {
 }
 
 pub(crate) fn expand_directory(repo_root: &Path, directory: &Path, output: &mut BTreeSet<PathBuf>) {
-    let entries = match std::fs::read_dir(directory) {
+    let entries = match fs::read_dir(directory) {
         Ok(entries) => entries,
         Err(_) => return,
     };
@@ -388,18 +399,34 @@ pub(crate) fn expand_directory(repo_root: &Path, directory: &Path, output: &mut 
         let Ok(entry) = entry else {
             continue;
         };
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_symlink() {
+            continue;
+        }
         let absolute = entry.path();
         let Ok(relative) = absolute.strip_prefix(repo_root) else {
             continue;
         };
         let relative = relative.to_path_buf();
+        if is_worktrees_relative_path(&relative) {
+            continue;
+        }
 
         output.insert(relative.clone());
 
-        if absolute.is_dir() {
+        if file_type.is_dir() {
             expand_directory(repo_root, &absolute, output);
         }
     }
+}
+
+fn is_worktrees_relative_path(path: &Path) -> bool {
+    matches!(
+        path.components().next(),
+        Some(Component::Normal(value)) if value == "worktrees"
+    )
 }
 
 pub(crate) fn insert_path(
@@ -469,9 +496,14 @@ pub(crate) fn insert_path(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
     use std::path::PathBuf;
 
     use super::ExtrasState;
+    use super::expand_directory;
+
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
 
     #[test]
     fn from_candidates_skips_invalid_relative_paths() {
@@ -491,6 +523,71 @@ mod tests {
 
         assert!(state.nodes.contains_key("keep.txt"));
         assert!(!state.nodes.contains_key("../outside.txt"));
+    }
+
+    #[test]
+    fn from_candidates_skips_worktrees_directory() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let repo_root = temp.path().join("repo");
+        std::fs::create_dir_all(repo_root.join("worktrees/cache")).expect("worktrees");
+        std::fs::write(repo_root.join("keep.txt"), "ok").expect("keep");
+        std::fs::write(repo_root.join("worktrees/cache/state.txt"), "state").expect("state");
+
+        let state = ExtrasState::from_candidates(
+            &repo_root,
+            &[PathBuf::from("worktrees"), PathBuf::from("keep.txt")],
+        )
+        .expect("state");
+
+        assert!(state.nodes.contains_key("keep.txt"));
+        assert!(!state.nodes.contains_key("worktrees"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn from_candidates_skips_symlink_candidates() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let repo_root = temp.path().join("repo");
+        let outside_root = temp.path().join("outside");
+
+        std::fs::create_dir_all(&repo_root).expect("repo");
+        std::fs::create_dir_all(&outside_root).expect("outside");
+        std::fs::write(outside_root.join("secret.txt"), "TOPSECRET").expect("secret");
+        symlink(outside_root.join("secret.txt"), repo_root.join("link.txt")).expect("symlink");
+        std::fs::write(repo_root.join("keep.txt"), "keep").expect("keep");
+
+        let state = ExtrasState::from_candidates(
+            &repo_root,
+            &[PathBuf::from("link.txt"), PathBuf::from("keep.txt")],
+        )
+        .expect("state");
+
+        assert!(state.nodes.contains_key("keep.txt"));
+        assert!(!state.nodes.contains_key("link.txt"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn expand_directory_skips_symlink_children() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let repo_root = temp.path().join("repo");
+        let outside_root = temp.path().join("outside");
+
+        std::fs::create_dir_all(repo_root.join("assets")).expect("assets");
+        std::fs::create_dir_all(&outside_root).expect("outside");
+        std::fs::write(repo_root.join("assets/keep.txt"), "keep").expect("keep");
+        std::fs::write(outside_root.join("secret.txt"), "TOPSECRET").expect("secret");
+        symlink(
+            outside_root.join("secret.txt"),
+            repo_root.join("assets/link.txt"),
+        )
+        .expect("symlink");
+
+        let mut output = BTreeSet::new();
+        expand_directory(&repo_root, &repo_root.join("assets"), &mut output);
+
+        assert!(output.contains(&PathBuf::from("assets/keep.txt")));
+        assert!(!output.contains(&PathBuf::from("assets/link.txt")));
     }
 
     #[cfg(unix)]

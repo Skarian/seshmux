@@ -48,7 +48,7 @@ pub enum GitError {
     #[error("failed to parse git output: {0}")]
     Parse(String),
     #[error(
-        "repository has no commits yet; create an initial commit or choose a different start point"
+        "current branch/HEAD has no commits yet; create an initial commit on this branch or choose a Branch/Commit start point"
     )]
     NoCommits,
     #[error("branch '{branch}' is not fully merged; safe delete aborted")]
@@ -482,6 +482,11 @@ mod tests {
 
         let error = resolve_current_start_point(Path::new("."), &runner).expect_err("should fail");
         assert!(matches!(error, GitError::NoCommits));
+        assert!(
+            error
+                .to_string()
+                .contains("current branch/HEAD has no commits yet")
+        );
     }
 
     #[test]

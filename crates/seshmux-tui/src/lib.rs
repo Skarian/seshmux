@@ -9,7 +9,7 @@ mod ui;
 use std::io::{Stdout, stdout};
 use std::path::Path;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use attach_flow::AttachScreen;
 use crossterm::cursor::{Hide, Show};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -75,11 +75,23 @@ pub(crate) struct TerminalSession {
 
 impl TerminalSession {
     pub(crate) fn enter() -> Result<Self> {
-        enable_raw_mode().context("failed to enable raw mode")?;
-        let mut out = stdout();
-        execute!(out, EnterAlternateScreen, Hide).context("failed to initialize terminal")?;
-        let backend = CrosstermBackend::new(out);
-        let terminal = Terminal::new(backend).context("failed to create terminal backend")?;
+        let terminal = enter_with_ops(
+            || enable_raw_mode().context("failed to enable raw mode"),
+            || {
+                let mut out = stdout();
+                execute!(out, EnterAlternateScreen, Hide).context("failed to initialize terminal")
+            },
+            || {
+                let backend = CrosstermBackend::new(stdout());
+                Terminal::new(backend).context("failed to create terminal backend")
+            },
+            || {
+                let mut out = stdout();
+                execute!(out, Show, LeaveAlternateScreen)
+                    .context("failed to restore terminal screen during rollback")
+            },
+            || disable_raw_mode().context("failed to disable raw mode during rollback"),
+        )?;
         Ok(Self { terminal })
     }
 
@@ -105,6 +117,108 @@ impl Drop for TerminalSession {
     fn drop(&mut self) {
         let _ = execute!(self.terminal.backend_mut(), Show, LeaveAlternateScreen);
         let _ = disable_raw_mode();
+    }
+}
+
+fn enter_with_ops<
+    T,
+    EnableRawMode,
+    EnterAltScreen,
+    CreateTerminal,
+    LeaveAltScreen,
+    DisableRawMode,
+>(
+    mut enable_raw_mode_op: EnableRawMode,
+    mut enter_alt_screen_op: EnterAltScreen,
+    mut create_terminal_op: CreateTerminal,
+    mut leave_alt_screen_op: LeaveAltScreen,
+    mut disable_raw_mode_op: DisableRawMode,
+) -> Result<T>
+where
+    EnableRawMode: FnMut() -> Result<()>,
+    EnterAltScreen: FnMut() -> Result<()>,
+    CreateTerminal: FnMut() -> Result<T>,
+    LeaveAltScreen: FnMut() -> Result<()>,
+    DisableRawMode: FnMut() -> Result<()>,
+{
+    enable_raw_mode_op()?;
+
+    if let Err(error) = enter_alt_screen_op() {
+        return Err(failure_with_rollback(
+            error,
+            true,
+            false,
+            &mut leave_alt_screen_op,
+            &mut disable_raw_mode_op,
+        ));
+    }
+
+    match create_terminal_op() {
+        Ok(terminal) => Ok(terminal),
+        Err(error) => Err(failure_with_rollback(
+            error,
+            true,
+            true,
+            &mut leave_alt_screen_op,
+            &mut disable_raw_mode_op,
+        )),
+    }
+}
+
+fn failure_with_rollback<LeaveAltScreen, DisableRawMode>(
+    setup_error: anyhow::Error,
+    raw_enabled: bool,
+    alt_screen_entered: bool,
+    leave_alt_screen_op: &mut LeaveAltScreen,
+    disable_raw_mode_op: &mut DisableRawMode,
+) -> anyhow::Error
+where
+    LeaveAltScreen: FnMut() -> Result<()>,
+    DisableRawMode: FnMut() -> Result<()>,
+{
+    let cleanup_error = rollback_partial_terminal_setup(
+        raw_enabled,
+        alt_screen_entered,
+        leave_alt_screen_op,
+        disable_raw_mode_op,
+    );
+
+    match cleanup_error {
+        Some(cleanup_error) => {
+            anyhow!("{setup_error:#}\nterminal rollback cleanup failed: {cleanup_error:#}")
+        }
+        None => setup_error,
+    }
+}
+
+fn rollback_partial_terminal_setup<LeaveAltScreen, DisableRawMode>(
+    raw_enabled: bool,
+    alt_screen_entered: bool,
+    leave_alt_screen_op: &mut LeaveAltScreen,
+    disable_raw_mode_op: &mut DisableRawMode,
+) -> Option<anyhow::Error>
+where
+    LeaveAltScreen: FnMut() -> Result<()>,
+    DisableRawMode: FnMut() -> Result<()>,
+{
+    let mut cleanup_failures = Vec::<String>::new();
+
+    if alt_screen_entered && let Err(error) = leave_alt_screen_op() {
+        cleanup_failures.push(format!(
+            "failed to restore alternate screen during rollback: {error:#}"
+        ));
+    }
+
+    if raw_enabled && let Err(error) = disable_raw_mode_op() {
+        cleanup_failures.push(format!(
+            "failed to disable raw mode during rollback: {error:#}"
+        ));
+    }
+
+    if cleanup_failures.is_empty() {
+        None
+    } else {
+        Some(anyhow!(cleanup_failures.join("\n")))
     }
 }
 
@@ -343,10 +457,13 @@ pub(crate) fn centered_rect(
 
 #[cfg(test)]
 mod tests {
+    use anyhow::anyhow;
+    use std::cell::RefCell;
+
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::layout::Rect;
 
-    use super::{RootMenuExit, RootScreen, centered_rect};
+    use super::{RootMenuExit, RootScreen, centered_rect, enter_with_ops};
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -390,5 +507,126 @@ mod tests {
 
         let _ = root.on_key(key(KeyCode::Char('k')));
         assert_eq!(root.selected, 1);
+    }
+
+    #[test]
+    fn enter_with_ops_rolls_back_raw_mode_when_alt_screen_step_fails() {
+        let calls = RefCell::new(Vec::<&'static str>::new());
+
+        let error = enter_with_ops(
+            || {
+                calls.borrow_mut().push("enable_raw_mode");
+                Ok(())
+            },
+            || {
+                calls.borrow_mut().push("enter_alt_screen");
+                Err(anyhow!("enter alt failed"))
+            },
+            || {
+                calls.borrow_mut().push("create_terminal");
+                Ok(())
+            },
+            || {
+                calls.borrow_mut().push("leave_alt_screen");
+                Ok(())
+            },
+            || {
+                calls.borrow_mut().push("disable_raw_mode");
+                Ok(())
+            },
+        )
+        .expect_err("enter should fail");
+
+        assert_eq!(
+            calls.into_inner(),
+            vec!["enable_raw_mode", "enter_alt_screen", "disable_raw_mode"]
+        );
+        assert!(format!("{error:#}").contains("enter alt failed"));
+    }
+
+    #[test]
+    fn enter_with_ops_rolls_back_alt_screen_then_raw_mode_when_terminal_creation_fails() {
+        let calls = RefCell::new(Vec::<&'static str>::new());
+
+        let error = enter_with_ops(
+            || {
+                calls.borrow_mut().push("enable_raw_mode");
+                Ok(())
+            },
+            || {
+                calls.borrow_mut().push("enter_alt_screen");
+                Ok(())
+            },
+            || {
+                calls.borrow_mut().push("create_terminal");
+                Err::<(), _>(anyhow!("create terminal failed"))
+            },
+            || {
+                calls.borrow_mut().push("leave_alt_screen");
+                Ok(())
+            },
+            || {
+                calls.borrow_mut().push("disable_raw_mode");
+                Ok(())
+            },
+        )
+        .expect_err("enter should fail");
+
+        assert_eq!(
+            calls.into_inner(),
+            vec![
+                "enable_raw_mode",
+                "enter_alt_screen",
+                "create_terminal",
+                "leave_alt_screen",
+                "disable_raw_mode",
+            ]
+        );
+        assert!(format!("{error:#}").contains("create terminal failed"));
+    }
+
+    #[test]
+    fn enter_with_ops_attempts_both_cleanup_steps_when_alt_cleanup_fails() {
+        let calls = RefCell::new(Vec::<&'static str>::new());
+
+        let error = enter_with_ops(
+            || {
+                calls.borrow_mut().push("enable_raw_mode");
+                Ok(())
+            },
+            || {
+                calls.borrow_mut().push("enter_alt_screen");
+                Ok(())
+            },
+            || {
+                calls.borrow_mut().push("create_terminal");
+                Err::<(), _>(anyhow!("create terminal failed"))
+            },
+            || {
+                calls.borrow_mut().push("leave_alt_screen");
+                Err(anyhow!("leave alt failed"))
+            },
+            || {
+                calls.borrow_mut().push("disable_raw_mode");
+                Err(anyhow!("disable raw failed"))
+            },
+        )
+        .expect_err("enter should fail");
+
+        assert_eq!(
+            calls.into_inner(),
+            vec![
+                "enable_raw_mode",
+                "enter_alt_screen",
+                "create_terminal",
+                "leave_alt_screen",
+                "disable_raw_mode",
+            ]
+        );
+
+        let message = format!("{error:#}");
+        assert!(message.contains("create terminal failed"));
+        assert!(message.contains("leave alt failed"));
+        assert!(message.contains("disable raw failed"));
     }
 }

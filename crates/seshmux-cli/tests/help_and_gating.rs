@@ -2,6 +2,8 @@ mod support;
 
 use predicates::prelude::*;
 use std::fs;
+use std::path::Path;
+use std::process::Command as StdCommand;
 
 use support::{
     assert_timestamp_log_names, init_git_repo, new_command_with_temp_home, write_valid_config,
@@ -94,7 +96,32 @@ fn root_command_fails_in_repo_with_no_commits_before_tui() {
         .current_dir(&repo_dir)
         .assert()
         .failure()
-        .stderr(predicate::str::contains("repository has no commits yet"));
+        .stderr(predicate::str::contains(
+            "current branch/HEAD has no commits yet",
+        ));
+}
+
+#[test]
+fn root_command_fails_when_current_branch_head_is_unborn_even_with_existing_history() {
+    let (mut command, temp_home) = new_command_with_temp_home();
+    write_valid_config(temp_home.path());
+    let repo_dir = temp_home.path().join("orphan-head-repo");
+    init_git_repo(&repo_dir);
+
+    run_git(&repo_dir, &["config", "user.email", "seshmux@example.com"]);
+    run_git(&repo_dir, &["config", "user.name", "seshmux-test"]);
+    fs::write(repo_dir.join("seed.txt"), "seed").expect("seed file");
+    run_git(&repo_dir, &["add", "seed.txt"]);
+    run_git(&repo_dir, &["commit", "-m", "seed commit"]);
+    run_git(&repo_dir, &["checkout", "--orphan", "scratch"]);
+
+    command
+        .current_dir(&repo_dir)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "current branch/HEAD has no commits yet",
+        ));
 }
 
 #[test]
@@ -112,4 +139,19 @@ fn doctor_with_diagnostics_creates_log_file() {
         .filter_map(Result::ok)
         .collect();
     assert_timestamp_log_names(&logs);
+}
+
+fn run_git(repo_dir: &Path, args: &[&str]) {
+    let output = StdCommand::new("git")
+        .args(args)
+        .current_dir(repo_dir)
+        .output()
+        .expect("run git");
+
+    assert!(
+        output.status.success(),
+        "git {:?} failed: {}",
+        args,
+        String::from_utf8_lossy(&output.stderr)
+    );
 }

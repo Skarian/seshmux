@@ -118,7 +118,7 @@ impl NewFlow {
         let commits = ops.query_commits(&prepare.repo_root, "", 1)?;
         if commits.is_empty() {
             return Err(anyhow!(
-                "repository has no commits yet; create an initial commit before starting seshmux"
+                "current branch/HEAD has no commits yet; create an initial commit on this branch before starting seshmux"
             ));
         }
         let candidates = ops.list_extras(&prepare.repo_root)?;
@@ -280,7 +280,11 @@ mod tests {
         ops.latest_commits.clear();
 
         let error = NewFlow::new(&ops, &repo_root).expect_err("flow should fail");
-        assert!(error.to_string().contains("repository has no commits yet"));
+        assert!(
+            error
+                .to_string()
+                .contains("current branch/HEAD has no commits yet")
+        );
     }
 
     #[test]

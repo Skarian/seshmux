@@ -62,7 +62,7 @@ impl<'a> App<'a> {
 
         if commits.is_empty() {
             bail!(
-                "repository has no commits yet; create an initial commit before starting seshmux"
+                "current branch/HEAD has no commits yet; create an initial commit on this branch before starting seshmux"
             );
         }
 

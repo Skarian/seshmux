@@ -52,6 +52,12 @@ pub fn list_extra_candidates(
 
     for entry in untracked.into_iter().chain(ignored.into_iter()) {
         let normalized = normalize_extra_relative_path(&entry)?;
+        if is_worktrees_relative_path(&normalized) {
+            continue;
+        }
+        if is_symlink_candidate(repo_root, &normalized) {
+            continue;
+        }
         set.insert(normalized);
     }
 
@@ -65,10 +71,13 @@ pub fn copy_selected_extras(
 ) -> Result<(), ExtrasError> {
     for relative in selected {
         let normalized = normalize_extra_relative_path(relative)?;
+        if is_worktrees_relative_path(&normalized) {
+            continue;
+        }
 
         let source = repo_root.join(&normalized);
         let target = target_root.join(&normalized);
-        copy_existing_path(&source, &target)?;
+        copy_existing_path(repo_root, &source, &target)?;
     }
 
     Ok(())
@@ -98,28 +107,67 @@ pub fn normalize_extra_relative_path(path: &Path) -> Result<PathBuf, ExtrasError
     Ok(clean)
 }
 
-fn copy_directory_recursive(source: &Path, target: &Path) -> Result<(), ExtrasError> {
+fn copy_directory_recursive(
+    repo_root: &Path,
+    source: &Path,
+    target: &Path,
+) -> Result<(), ExtrasError> {
     create_dir_all(source, target, target)?;
     for entry in read_dir(source, source, target)? {
         let entry = entry.map_err(|error| copy_error(source, target, error))?;
         let child_source = entry.path();
         let child_target = target.join(entry.file_name());
-        copy_existing_path(&child_source, &child_target)?;
+        copy_existing_path(repo_root, &child_source, &child_target)?;
     }
 
     Ok(())
 }
 
-fn copy_existing_path(source: &Path, target: &Path) -> Result<(), ExtrasError> {
-    if source.is_dir() {
-        return copy_directory_recursive(source, target);
+fn copy_existing_path(repo_root: &Path, source: &Path, target: &Path) -> Result<(), ExtrasError> {
+    if is_worktrees_source_path(repo_root, source) {
+        return Ok(());
     }
 
-    if source.is_file() {
+    let metadata = match fs::symlink_metadata(source) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(copy_error(source, target, error)),
+    };
+
+    if metadata.file_type().is_symlink() {
+        return Ok(());
+    }
+
+    if metadata.is_dir() {
+        return copy_directory_recursive(repo_root, source, target);
+    }
+
+    if metadata.is_file() {
         return copy_file(source, target);
     }
 
     Ok(())
+}
+
+fn is_symlink_candidate(repo_root: &Path, relative: &Path) -> bool {
+    match fs::symlink_metadata(repo_root.join(relative)) {
+        Ok(metadata) => metadata.file_type().is_symlink(),
+        Err(_) => true,
+    }
+}
+
+fn is_worktrees_source_path(repo_root: &Path, path: &Path) -> bool {
+    let Ok(relative) = path.strip_prefix(repo_root) else {
+        return false;
+    };
+    is_worktrees_relative_path(relative)
+}
+
+fn is_worktrees_relative_path(path: &Path) -> bool {
+    matches!(
+        path.components().next(),
+        Some(Component::Normal(value)) if value == "worktrees"
+    )
 }
 
 fn copy_file(source: &Path, target: &Path) -> Result<(), ExtrasError> {
@@ -177,17 +225,26 @@ fn run_git_lines(
 mod tests {
     use crate::test_support::{RecordingRunner, output};
     use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
     use std::path::Path;
 
     use super::*;
 
     #[test]
     fn list_extra_candidates_merges_and_deduplicates() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let repo_root = temp.path().join("repo");
+        fs::create_dir_all(&repo_root).expect("repo");
+        fs::write(repo_root.join("a.txt"), "a").expect("a");
+        fs::write(repo_root.join("b.txt"), "b").expect("b");
+        fs::write(repo_root.join("common.txt"), "common").expect("common");
+
         let runner = RecordingRunner::from_outputs(vec![
             output("a.txt\ncommon.txt\n", "", 0),
             output("common.txt\nb.txt\n", "", 0),
         ]);
-        let entries = list_extra_candidates(Path::new("/tmp/repo"), &runner).expect("entries");
+        let entries = list_extra_candidates(&repo_root, &runner).expect("entries");
         assert_eq!(
             entries,
             vec![
@@ -195,6 +252,26 @@ mod tests {
                 PathBuf::from("b.txt"),
                 PathBuf::from("common.txt")
             ]
+        );
+    }
+
+    #[test]
+    fn list_extra_candidates_skips_worktrees_directory() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let repo_root = temp.path().join("repo");
+        fs::create_dir_all(repo_root.join("worktrees/cache")).expect("worktrees dir");
+        fs::write(repo_root.join("a.txt"), "a").expect("file a");
+        fs::write(repo_root.join("b.txt"), "b").expect("file b");
+
+        let runner = RecordingRunner::from_outputs(vec![
+            output("worktrees/\na.txt\n", "", 0),
+            output("worktrees/cache/\nb.txt\n", "", 0),
+        ]);
+
+        let entries = list_extra_candidates(&repo_root, &runner).expect("entries");
+        assert_eq!(
+            entries,
+            vec![PathBuf::from("a.txt"), PathBuf::from("b.txt")]
         );
     }
 
@@ -217,6 +294,97 @@ mod tests {
         let copied = target_root.join("nested").join("file.txt");
         assert!(copied.exists());
         assert_eq!(fs::read_to_string(copied).expect("read copied"), "hello");
+    }
+
+    #[test]
+    fn copy_selected_extras_skips_worktrees_directory_paths() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let repo_root = temp.path().join("repo");
+        let target_root = temp.path().join("target");
+
+        fs::create_dir_all(repo_root.join("worktrees/cache")).expect("worktrees");
+        fs::write(repo_root.join("worktrees/cache/state.txt"), "state").expect("state");
+        fs::write(repo_root.join("keep.txt"), "keep").expect("keep");
+
+        copy_selected_extras(
+            &repo_root,
+            &target_root,
+            &[
+                PathBuf::from("worktrees"),
+                PathBuf::from("worktrees/cache/state.txt"),
+                PathBuf::from("keep.txt"),
+            ],
+        )
+        .expect("copy extras");
+
+        assert!(target_root.join("keep.txt").exists());
+        assert!(!target_root.join("worktrees").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copy_selected_extras_skips_symlink_file() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let repo_root = temp.path().join("repo");
+        let target_root = temp.path().join("target");
+        let outside_root = temp.path().join("outside");
+
+        fs::create_dir_all(&repo_root).expect("repo");
+        fs::create_dir_all(&outside_root).expect("outside");
+        fs::write(outside_root.join("secret.txt"), "TOPSECRET").expect("secret");
+        symlink(outside_root.join("secret.txt"), repo_root.join("link.txt")).expect("symlink");
+
+        copy_selected_extras(&repo_root, &target_root, &[PathBuf::from("link.txt")])
+            .expect("copy extras");
+
+        assert!(!target_root.join("link.txt").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copy_selected_extras_skips_symlink_directory() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let repo_root = temp.path().join("repo");
+        let target_root = temp.path().join("target");
+        let outside_root = temp.path().join("outside");
+
+        fs::create_dir_all(&repo_root).expect("repo");
+        fs::create_dir_all(outside_root.join("secrets")).expect("outside");
+        fs::write(outside_root.join("secrets/file.txt"), "TOPSECRET").expect("secret");
+        symlink(outside_root.join("secrets"), repo_root.join("linkdir")).expect("symlink");
+
+        copy_selected_extras(&repo_root, &target_root, &[PathBuf::from("linkdir")])
+            .expect("copy extras");
+
+        assert!(!target_root.join("linkdir").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copy_selected_extras_skips_symlink_nested_in_selected_directory() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let repo_root = temp.path().join("repo");
+        let target_root = temp.path().join("target");
+        let outside_root = temp.path().join("outside");
+
+        fs::create_dir_all(repo_root.join("assets")).expect("assets");
+        fs::create_dir_all(&outside_root).expect("outside");
+        fs::write(repo_root.join("assets/keep.txt"), "keep").expect("keep");
+        fs::write(outside_root.join("secret.txt"), "TOPSECRET").expect("secret");
+        symlink(
+            outside_root.join("secret.txt"),
+            repo_root.join("assets/link.txt"),
+        )
+        .expect("symlink");
+
+        copy_selected_extras(&repo_root, &target_root, &[PathBuf::from("assets")])
+            .expect("copy extras");
+
+        assert_eq!(
+            fs::read_to_string(target_root.join("assets/keep.txt")).expect("copied keep"),
+            "keep"
+        );
+        assert!(!target_root.join("assets/link.txt").exists());
     }
 
     #[test]
