@@ -1,82 +1,109 @@
 # seshmux
 
-`seshmux` is a TUI-first Rust tool for managing git worktrees paired with tmux sessions.
+`seshmux` is a rust tui for managing git worktrees with dedicated tmux sessions
 
-Runtime expectations:
+## Requirements
 
-- Run `seshmux` from inside a git repository.
-- The repository must have at least one commit before runtime flows start.
-- Runtime TUI requires a valid config file.
+- macOS
+- `git` with `git worktree`
+- `tmux`
+
+## Install
+
+```bash
+cargo install --path crates/seshmux-cli --force
+```
+
+## Quick Start
+
+Run from inside a git repository with at least one commit on the current branch/HEAD:
+
+```bash
+seshmux
+```
+
+If this is your first run, complete setup first.
+
+## Setup
+
+1. Run diagnostics:
+
+```bash
+seshmux doctor
+```
+
+2. Create config directory:
+
+```bash
+mkdir -p ~/.config/seshmux
+```
+
+3. Create `~/.config/seshmux/config.toml`.
+   Use the format in the `Configuration` section below.
 
 ## Configuration
 
-`seshmux` requires a config file before the interactive runtime (`seshmux`) will run.
+`~/.config/seshmux/config.toml` defines the tmux session layout that `seshmux` creates for worktrees.
 
-Create `~/.config/seshmux/config.toml`:
+How it works:
+
+- `version` is the config schema version (`1`)
+- `[[tmux.windows]]` defines tmux windows that `seshmux` creates for each worktree session
+- Window entries are created in the same order they appear in the file
+- Use window names and commands that match your normal workflow (editor, git UI, build/test, etc.)
+
+Field reference:
+
+- `name`: required display name for the tmux window
+- `program`: executable for direct mode (example: `nvim`, `lazygit`, `pnpm`)
+- `args`: optional argument list for direct mode (`["."]` means pass `.` as one argument)
+- `shell`: shell invocation array for shell mode (example: `["/bin/zsh", "-lc"]`)
+- `command`: command string run by the shell in shell mode
+
+Direct vs shell mode:
+
+- Direct mode runs a program directly with explicit args. Use this for most windows.
+- Shell mode starts a shell, then the shell interprets `command`. Use this when commands depend on shell `PATH`/environment, or when you need shell behavior like chaining commands (`&&`), pipes (`|`), redirects (`>`), or shell expansion.
+- Each window must use exactly one mode, not both.
+- To use direct mode for a window: set `program` (optionally `args`) and do not set `shell`/`command`.
+- To use shell mode for a window: set `shell` and `command` and do not set `program`/`args`.
+
+Validation rules:
+
+- `version` must be `1`
+- At least one `[[tmux.windows]]` entry is required
+- `name` is required and must be non-empty
+- Each window must use exactly one launch mode
+- Direct mode: `program` required, `args` optional
+- Shell mode: `shell` required, `shell[0]` must be a non-empty executable, `command` required and non-empty
+
+Example:
 
 ```toml
 version = 1
 
-[[tmux.windows]]
-name = "codex"
-program = "codex"
-args = []
-
+# Direct mode window: runs `nvim .` directly (no shell).
 [[tmux.windows]]
 name = "editor"
 program = "nvim"
-args = []
+args = ["."]
 
+# Direct mode window: runs `lazygit` directly.
 [[tmux.windows]]
 name = "git"
 program = "lazygit"
-args = []
 
+# Shell mode window: runs through zsh so shell PATH/env and shell syntax apply.
 [[tmux.windows]]
-name = "ops"
+name = "dev"
 shell = ["/bin/zsh", "-lc"]
-command = "echo ready && pwd"
+command = "pnpm dev"
 ```
-
-Launch-mode rules:
-
-- direct mode uses `program` with optional `args`.
-- shell mode uses `shell` and `command`.
-- each window must use exactly one mode.
 
 ## Commands
 
-- `seshmux`
-- `seshmux doctor`
-- `seshmux --diagnostics`
-- `seshmux --diagnostics doctor`
+- `seshmux` opens the interactive TUI (`new`, `list`, `attach`, `delete`)
+- `seshmux doctor` runs environment/config checks
+- `seshmux --diagnostics` (or `seshmux --diagnostics doctor`) writes logs to `~/.config/seshmux/diagnostics/<timestamp>.log`
 - `seshmux --help`
 - `seshmux doctor --help`
-
-## Diagnostics
-
-- `--diagnostics` writes a runtime log to `~/.config/seshmux/diagnostics/<timestamp>.log`.
-- If an internal panic occurs, seshmux prints a fatal message and references the diagnostics log path when available.
-- Without `--diagnostics`, seshmux still prints a fatal message and tells you to rerun with diagnostics.
-
-## Runtime Flows
-
-The root TUI menu includes:
-
-- `New worktree`
-- `List worktrees`
-- `Attach session`
-- `Delete worktree`
-
-Delete behavior:
-
-- Delete first attempts safe worktree removal.
-- If safe worktree removal fails, seshmux shows the git error and asks whether to force delete.
-- If safe branch deletion fails, seshmux shows the git error and asks whether to force delete the branch.
-
-## Key Semantics
-
-- `Esc`: back one step inside flows. On first step of a flow, returns to root. From root, exits the TUI.
-- `q`: exits the TUI from root.
-- Yes/No prompts: `Space` toggles selection and `Enter` confirms.
-- List/filter screens (`list`, `attach`, `delete`): `Tab` toggles focus between the table and filter input. `j/k` table movement applies only in table focus.
