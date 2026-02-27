@@ -1,5 +1,7 @@
 /target
 .DS_Store
 /.agent
+/.agents
 AGENTS.md
 PRD.md
+skills-lock.json
