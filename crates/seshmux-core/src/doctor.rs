@@ -58,13 +58,13 @@ pub fn run_doctor() -> DoctorReport {
 pub fn run_doctor_with_runner(runner: &dyn CommandRunner) -> DoctorReport {
     let mut checks = Vec::new();
 
-    checks.push(if env::consts::OS == "macos" {
-        pass_check("os is macOS", "detected macOS")
-    } else {
-        fail_check(
-            "os is macOS",
-            format!("detected {}, expected macOS", env::consts::OS),
-        )
+    checks.push(match env::consts::OS {
+        "macos" => pass_check("os is supported", "detected macOS"),
+        "linux" => pass_check("os is supported", "detected Linux"),
+        detected => fail_check(
+            "os is supported",
+            format!("detected {detected}, expected macOS or Linux"),
+        ),
     });
 
     checks.push(if is_executable_in_path("git") {

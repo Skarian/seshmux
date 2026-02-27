@@ -46,7 +46,7 @@
 
 ## Requirements
 
-- macOS
+- Linux or macOS
 - `git` with `git worktree`
 - `tmux`
 
