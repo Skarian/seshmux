@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use crossterm::event::{Event, KeyCode, KeyEvent};
+use crossterm::event::{Event, KeyCode, KeyEvent, MouseEvent, MouseEventKind};
 use tui_input::backend::crossterm::EventHandler;
 
 use crate::UiExit;
@@ -7,22 +7,38 @@ use crate::keymap;
 use crate::ui::binary_choice::BinaryChoiceEvent;
 
 use super::picker::{PickerAction, PickerState};
-use super::{FlowSignal, NewFlow, NewFlowOps, Step};
+use super::{
+    ConnectBackTarget, FlowSignal, NewFlow, NewFlowErrorOrigin, NewFlowErrorState, NewFlowOps, Step,
+};
 use seshmux_app::{NewRequest, NewStartPoint};
 
 impl NewFlow {
     pub(super) fn on_key(&mut self, key: KeyEvent, ops: &dyn NewFlowOps) -> Result<FlowSignal> {
-        match self.step {
+        match &self.step {
             Step::GitignoreDecision => self.on_key_gitignore(key),
             Step::NameInput => self.on_key_name(key),
             Step::StartPointMode => self.on_key_start_mode(key, ops),
             Step::BranchPicker => self.on_key_branch_picker(key, ops),
             Step::CommitPicker => self.on_key_commit_picker(key, ops),
+            Step::CopyExtrasDecision => self.on_key_copy_extras_decision(key, ops),
+            Step::ExtrasIndexing => self.on_key_extras_indexing(key, ops),
             Step::ExtrasPicker => self.on_key_extras(key),
             Step::ConnectNow => self.on_key_connect_now(key),
             Step::Review => self.on_key_review(key, ops),
             Step::Success => self.on_key_success(key),
-            Step::ErrorScreen => self.on_key_error(key),
+            Step::ErrorScreen(_) => self.on_key_error(key),
+        }
+    }
+
+    pub(super) fn on_mouse(&mut self, mouse: MouseEvent) {
+        if self.step != Step::ExtrasPicker {
+            return;
+        }
+
+        match mouse.kind {
+            MouseEventKind::ScrollUp => self.extras.move_up_by(3),
+            MouseEventKind::ScrollDown => self.extras.move_down_by(3),
+            _ => {}
         }
     }
 
@@ -90,7 +106,7 @@ impl NewFlow {
             match self.start_mode_selected {
                 0 => {
                     self.start_point = Some(NewStartPoint::CurrentBranch);
-                    self.step = Step::ExtrasPicker;
+                    self.step = Step::CopyExtrasDecision;
                 }
                 1 => {
                     let query = self.branch_search_input.value().trim().to_string();
@@ -164,7 +180,7 @@ impl NewFlow {
             if let Some(branch_name) = selection {
                 self.start_point = Some(NewStartPoint::Branch(branch_name));
                 self.branch_filter_focused = false;
-                self.step = Step::ExtrasPicker;
+                self.step = Step::CopyExtrasDecision;
             }
         }
 
@@ -225,10 +241,77 @@ impl NewFlow {
             if let Some(commit_hash) = selection {
                 self.start_point = Some(NewStartPoint::Commit(commit_hash));
                 self.commit_filter_focused = false;
-                self.step = Step::ExtrasPicker;
+                self.step = Step::CopyExtrasDecision;
             }
         }
 
+        Ok(FlowSignal::Continue)
+    }
+
+    fn on_key_copy_extras_decision(
+        &mut self,
+        key: KeyEvent,
+        ops: &dyn NewFlowOps,
+    ) -> Result<FlowSignal> {
+        match self.copy_extras_choice.on_key(key) {
+            BinaryChoiceEvent::Back => {
+                self.pending_skip_buckets_to_persist_after_create = None;
+                self.step = self.start_point_step();
+                Ok(FlowSignal::Continue)
+            }
+            BinaryChoiceEvent::Continue => Ok(FlowSignal::Continue),
+            BinaryChoiceEvent::ConfirmNo => {
+                self.pending_skip_buckets_to_persist_after_create = None;
+                self.connect_choice = crate::ui::binary_choice::BinaryChoice::new(true);
+                self.connect_back_target = ConnectBackTarget::CopyExtrasDecision;
+                self.step = Step::ConnectNow;
+                Ok(FlowSignal::Continue)
+            }
+            BinaryChoiceEvent::ConfirmYes => {
+                self.begin_extras_indexing(ops);
+                Ok(FlowSignal::Continue)
+            }
+        }
+    }
+
+    fn on_key_extras_indexing(
+        &mut self,
+        key: KeyEvent,
+        ops: &dyn NewFlowOps,
+    ) -> Result<FlowSignal> {
+        if self.skip_modal_open() {
+            if keymap::is_back(key) {
+                self.cancel_skip_modal();
+                return Ok(FlowSignal::Continue);
+            }
+            if keymap::is_up(key) {
+                self.skip_modal_move_up();
+                return Ok(FlowSignal::Continue);
+            }
+            if keymap::is_down(key) {
+                self.skip_modal_move_down();
+                return Ok(FlowSignal::Continue);
+            }
+            if keymap::is_toggle(key) {
+                self.skip_modal_toggle_current();
+                return Ok(FlowSignal::Continue);
+            }
+            if keymap::is_confirm(key) {
+                self.confirm_skip_modal_and_start_build(ops);
+                return Ok(FlowSignal::Continue);
+            }
+            if matches!(key.code, KeyCode::Char('a')) {
+                self.skip_modal_toggle_persist();
+                return Ok(FlowSignal::Continue);
+            }
+            return Ok(FlowSignal::Continue);
+        }
+
+        if keymap::is_back(key) {
+            self.invalidate_extras_indexing();
+            self.pending_skip_buckets_to_persist_after_create = None;
+            self.step = Step::CopyExtrasDecision;
+        }
         Ok(FlowSignal::Continue)
     }
 
@@ -237,12 +320,8 @@ impl NewFlow {
             self.extras.editing_filter = false;
             self.branch_filter_focused = false;
             self.commit_filter_focused = false;
-            self.step = match self.start_point {
-                Some(NewStartPoint::CurrentBranch) => Step::StartPointMode,
-                Some(NewStartPoint::Branch(_)) => Step::BranchPicker,
-                Some(NewStartPoint::Commit(_)) => Step::CommitPicker,
-                None => Step::StartPointMode,
-            };
+            self.pending_skip_buckets_to_persist_after_create = None;
+            self.step = Step::CopyExtrasDecision;
             return Ok(FlowSignal::Continue);
         }
 
@@ -273,6 +352,7 @@ impl NewFlow {
 
         if keymap::is_confirm(key) {
             self.connect_choice = crate::ui::binary_choice::BinaryChoice::new(true);
+            self.connect_back_target = ConnectBackTarget::ExtrasPicker;
             self.step = Step::ConnectNow;
             return Ok(FlowSignal::Continue);
         }
@@ -290,7 +370,10 @@ impl NewFlow {
     fn on_key_connect_now(&mut self, key: KeyEvent) -> Result<FlowSignal> {
         match self.connect_choice.on_key(key) {
             BinaryChoiceEvent::Back => {
-                self.step = Step::ExtrasPicker;
+                self.step = match self.connect_back_target {
+                    ConnectBackTarget::CopyExtrasDecision => Step::CopyExtrasDecision,
+                    ConnectBackTarget::ExtrasPicker => Step::ExtrasPicker,
+                };
                 Ok(FlowSignal::Continue)
             }
             BinaryChoiceEvent::Continue => Ok(FlowSignal::Continue),
@@ -318,19 +401,40 @@ impl NewFlow {
                 start_point,
                 add_worktrees_gitignore_entry: !self.prepare.gitignore_has_worktrees_entry
                     && self.gitignore_choice.yes_selected,
-                selected_extras: self.extras.selected_for_copy(),
+                selected_extras: if self.copy_extras_choice.yes_selected {
+                    self.extras.selected_for_copy()
+                } else {
+                    Vec::new()
+                },
                 connect_now: self.connect_choice.yes_selected,
             };
 
             match ops.execute_new(request) {
                 Ok(result) => {
+                    if self.copy_extras_choice.yes_selected
+                        && let Some(buckets) =
+                            self.pending_skip_buckets_to_persist_after_create.take()
+                        && let Err(error) =
+                            ops.save_always_skip_buckets(&self.prepare.repo_root, &buckets)
+                    {
+                        self.success = Some(result);
+                        self.success_notice = Some(format!(
+                            "Worktree created, but failed to persist extras skip settings: {error}"
+                        ));
+                        self.step = Step::Success;
+                        return Ok(FlowSignal::Continue);
+                    }
+
+                    self.pending_skip_buckets_to_persist_after_create = None;
                     self.success = Some(result);
+                    self.success_notice = None;
                     self.step = Step::Success;
-                    self.error_message = None;
                 }
                 Err(error) => {
-                    self.error_message = Some(format!("{error:#}"));
-                    self.step = Step::ErrorScreen;
+                    self.step = Step::ErrorScreen(NewFlowErrorState {
+                        origin: NewFlowErrorOrigin::ReviewSubmit,
+                        message: format!("{error:#}"),
+                    });
                 }
             }
         }
@@ -352,11 +456,15 @@ impl NewFlow {
 
     fn on_key_error(&mut self, key: KeyEvent) -> Result<FlowSignal> {
         if keymap::is_back(key) || keymap::is_confirm(key) {
-            self.step = Step::Review;
-            Ok(FlowSignal::Continue)
-        } else {
-            Ok(FlowSignal::Continue)
+            let Step::ErrorScreen(error) = &self.step else {
+                return Ok(FlowSignal::Continue);
+            };
+            self.step = match error.origin {
+                NewFlowErrorOrigin::ExtrasIndexing => Step::CopyExtrasDecision,
+                NewFlowErrorOrigin::ReviewSubmit => Step::Review,
+            };
         }
+        Ok(FlowSignal::Continue)
     }
 
     fn load_branches(

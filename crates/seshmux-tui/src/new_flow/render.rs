@@ -5,8 +5,12 @@ use ratatui::widgets::{List, ListItem, ListState, Paragraph, ScrollbarOrientatio
 use tui_tree_widget::{Scrollbar as TreeScrollbar, Tree};
 
 use super::picker::PickerState;
-use super::{NewFlow, NewStartPoint, Step};
+use super::{
+    ExtrasIndexingPhase, NewFlow, NewFlowErrorOrigin, NewFlowErrorState, NewStartPoint,
+    SkipModalState, Step,
+};
 use crate::theme;
+use crate::ui::loading::render_loading_modal;
 use crate::ui::modal::{ModalSpec, render_modal};
 use crate::ui::text::{
     compact_hint, focus_line, highlighted_label_value_line, key_hint_height, key_hint_paragraph,
@@ -22,17 +26,19 @@ struct PickerRenderSpec<'a> {
 
 impl NewFlow {
     pub(super) fn render(&self, frame: &mut ratatui::Frame<'_>) {
-        match self.step {
+        match &self.step {
             Step::GitignoreDecision => self.render_gitignore_decision(frame),
             Step::NameInput => self.render_name_input(frame),
             Step::StartPointMode => self.render_start_mode(frame),
             Step::BranchPicker => self.render_branch_picker(frame),
             Step::CommitPicker => self.render_commit_picker(frame),
+            Step::CopyExtrasDecision => self.render_copy_extras_decision(frame),
+            Step::ExtrasIndexing => self.render_extras_indexing(frame),
             Step::ExtrasPicker => self.render_extras_picker(frame),
             Step::ConnectNow => self.render_connect_now(frame),
             Step::Review => self.render_review(frame),
             Step::Success => self.render_success(frame),
-            Step::ErrorScreen => self.render_error(frame),
+            Step::ErrorScreen(error) => self.render_error(frame, error),
         }
     }
 
@@ -187,6 +193,163 @@ impl NewFlow {
         );
     }
 
+    fn render_copy_extras_decision(&self, frame: &mut ratatui::Frame<'_>) {
+        let key_text = compact_hint(
+            frame.area().width,
+            "Space: toggle    Enter: continue    Esc: back",
+            "Space toggle    Enter continue    Esc back",
+            "Space toggle | Enter continue | Esc back",
+        );
+        let body = Text::from(vec![
+            Line::from(""),
+            highlighted_label_value_line(
+                "Current Selection",
+                self.copy_extras_choice.selected_label(),
+            ),
+        ]);
+        render_modal(
+            frame,
+            ModalSpec {
+                title: "Copy untracked / gitignored files?",
+                title_style: Some(theme::focus_prompt()),
+                body,
+                key_hint: Some(key_text),
+                width_pct: 74,
+                height_pct: 44,
+            },
+        );
+    }
+
+    fn render_extras_indexing(&self, frame: &mut ratatui::Frame<'_>) {
+        let Some(indexing) = &self.extras_indexing else {
+            return;
+        };
+        let (message, key_hint) = match indexing.phase {
+            ExtrasIndexingPhase::Collecting => {
+                ("Collecting extras list from git".to_string(), "Esc: back")
+            }
+            ExtrasIndexingPhase::Classifying { candidate_count } => (
+                format!("Classifying {candidate_count} candidates"),
+                "Esc: back",
+            ),
+            ExtrasIndexingPhase::AwaitingSkipDecision {
+                flagged_bucket_count,
+            } => (
+                format!("Awaiting skip decision ({flagged_bucket_count} buckets)"),
+                "Esc: cancel",
+            ),
+            ExtrasIndexingPhase::Building { filtered_count } => (
+                format!("Building extras index ({filtered_count} candidates)"),
+                "Esc: back",
+            ),
+        };
+        render_loading_modal(
+            frame,
+            "Preparing extras",
+            &message,
+            key_hint,
+            &indexing.loading,
+        );
+
+        if let Some(skip_modal) = &indexing.skip_modal {
+            self.render_skip_modal(frame, skip_modal);
+        }
+    }
+
+    fn render_skip_modal(&self, frame: &mut ratatui::Frame<'_>, modal: &SkipModalState) {
+        let key_text = compact_hint(
+            frame.area().width,
+            "Up/Down: move    Space: toggle skip    a: toggle persist    Enter: confirm    Esc: cancel (set as always in config is fixed)",
+            "Up/Down move    Space toggle    a persist    Enter confirm    Esc cancel    config-always fixed",
+            "Up/Down | Space toggle | a persist | Enter confirm | Esc cancel | config-always fixed",
+        );
+
+        let rendered = render_modal(
+            frame,
+            ModalSpec {
+                title: "Skip large buckets?",
+                title_style: Some(theme::focus_prompt()),
+                body: Text::from(vec![Line::from("")]),
+                key_hint: Some(key_text),
+                width_pct: 86,
+                height_pct: 72,
+            },
+        );
+
+        let inner = rendered.body_area.inner(Margin {
+            vertical: 1,
+            horizontal: 1,
+        });
+        if inner.width == 0 || inner.height < 4 {
+            return;
+        }
+
+        let [header_area, list_area, footer_area] = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(2),
+                Constraint::Min(1),
+                Constraint::Length(1),
+            ])
+            .areas(inner);
+
+        frame.render_widget(
+            Paragraph::new(Text::from(vec![
+                Line::from("Large artifact buckets detected. Choose what to skip for this run."),
+                Line::from(""),
+            ])),
+            header_area,
+        );
+
+        let visible_rows = list_area.height as usize;
+        if visible_rows > 0 {
+            let total = modal.choices.len();
+            let mut window_start = modal.selected.saturating_sub(visible_rows / 2);
+            let max_start = total.saturating_sub(visible_rows);
+            if window_start > max_start {
+                window_start = max_start;
+            }
+            let window_end = (window_start + visible_rows).min(total);
+
+            let mut list_lines = Vec::<Line<'_>>::new();
+            for (index, choice) in modal.choices[window_start..window_end].iter().enumerate() {
+                let absolute_index = window_start + index;
+                let marker = if absolute_index == modal.selected {
+                    ">>"
+                } else {
+                    "  "
+                };
+                let selected = if choice.skip { "Yes" } else { "No" };
+                let config_note = if choice.locked_in_config {
+                    " (set as always in config)"
+                } else {
+                    ""
+                };
+                let line = format!(
+                    "{marker} skip={selected:>3}  {}{}  ({} files)",
+                    choice.bucket, config_note, choice.count
+                );
+                if absolute_index == modal.selected {
+                    list_lines.push(Line::from(Span::styled(
+                        line,
+                        theme::table_highlight(Color::Cyan),
+                    )));
+                } else {
+                    list_lines.push(Line::from(line));
+                }
+            }
+            frame.render_widget(Paragraph::new(Text::from(list_lines)), list_area);
+        }
+
+        frame.render_widget(
+            Paragraph::new(format!(
+                "Always skip selected buckets in this repo: {} (a to toggle)",
+                yes_no(modal.persist_always_skip),
+            )),
+            footer_area,
+        );
+    }
+
     fn render_extras_picker(&self, frame: &mut ratatui::Frame<'_>) {
         let area = frame.area();
         let key_label = if self.extras.editing_filter {
@@ -306,7 +469,7 @@ impl NewFlow {
             None => "UNCONFIRMED".to_string(),
         };
 
-        let extras_count = self.extras.selected_for_copy().len();
+        let extras_count = self.review_selected_extras_count();
         let review = Text::from(vec![
             label_value_line("Worktree name", self.name_input.value()),
             label_value_line("Start from", start_point),
@@ -316,6 +479,10 @@ impl NewFlow {
                     !self.prepare.gitignore_has_worktrees_entry
                         && self.gitignore_choice.yes_selected,
                 ),
+            ),
+            label_value_line(
+                "Copy untracked / gitignored files",
+                yes_no(self.copy_extras_choice.yes_selected),
             ),
             label_value_line(
                 "Untracked / gitignored files selected",
@@ -342,12 +509,17 @@ impl NewFlow {
     fn render_success(&self, frame: &mut ratatui::Frame<'_>) {
         let footer = result_footer(frame.area().width);
         let success = if let Some(result) = &self.success {
-            Text::from(vec![
+            let mut lines = vec![
                 label_value_line("Worktree path", result.worktree_path.display().to_string()),
                 label_value_line("tmux session name", result.session_name.clone()),
                 label_value_line("Attach command", result.attach_command.clone()),
                 label_value_line("Connected in this terminal", yes_no(result.connected_now)),
-            ])
+            ];
+            if let Some(notice) = &self.success_notice {
+                lines.push(Line::from(""));
+                lines.push(label_value_line("Notice", notice.clone()));
+            }
+            Text::from(lines)
         } else {
             Text::from(vec![Line::from("")])
         };
@@ -365,15 +537,15 @@ impl NewFlow {
         );
     }
 
-    fn render_error(&self, frame: &mut ratatui::Frame<'_>) {
-        let message = self
-            .error_message
-            .as_deref()
-            .unwrap_or("Unknown error while creating worktree");
+    fn render_error(&self, frame: &mut ratatui::Frame<'_>, error: &NewFlowErrorState) {
+        let headline = match error.origin {
+            NewFlowErrorOrigin::ExtrasIndexing => "Failed to prepare extras selection",
+            NewFlowErrorOrigin::ReviewSubmit => "Failed to create worktree",
+        };
         let body = Text::from(vec![
-            Line::from("Failed to create worktree"),
+            Line::from(headline),
             Line::from(""),
-            Line::from(message.to_string()),
+            Line::from(error.message.clone()),
         ]);
         render_modal(
             frame,

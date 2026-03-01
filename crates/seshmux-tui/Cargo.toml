@@ -8,6 +8,7 @@ license.workspace = true
 anyhow.workspace = true
 crossterm.workspace = true
 ratatui.workspace = true
+rayon.workspace = true
 seshmux-app = { path = "../seshmux-app" }
 seshmux-core = { path = "../seshmux-core" }
 tui-input.workspace = true

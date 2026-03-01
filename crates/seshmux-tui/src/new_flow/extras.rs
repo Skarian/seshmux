@@ -1,19 +1,25 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
-use std::fs;
 use std::path::{Component, Path, PathBuf};
 
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use crossterm::event::{Event, KeyEvent};
+use rayon::prelude::*;
 use tui_input::Input;
 use tui_input::backend::crossterm::EventHandler;
 use tui_tree_widget::{TreeItem, TreeState};
 
 #[derive(Debug, Clone)]
 pub(crate) struct ExtraNode {
-    pub(crate) key: String,
     pub(crate) label: String,
+    pub(crate) search_key: String,
     pub(crate) is_dir: bool,
     pub(crate) children: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ExtrasIndex {
+    pub(crate) nodes: BTreeMap<String, ExtraNode>,
+    pub(crate) roots: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -34,61 +40,38 @@ pub(crate) struct ExtrasState {
 }
 
 impl ExtrasState {
-    pub(crate) fn from_candidates(repo_root: &Path, candidates: &[PathBuf]) -> Result<Self> {
-        let mut normalized = BTreeSet::new();
+    pub(crate) fn from_candidates(candidates: &[PathBuf]) -> Result<Self> {
+        let index = build_extras_index_from_paths(candidates)?;
+        Ok(Self::from_index(index))
+    }
 
-        for candidate in candidates {
-            let relative = match seshmux_core::extras::normalize_extra_relative_path(candidate) {
-                Ok(path) => path,
-                Err(_) => continue,
-            };
-            if is_worktrees_relative_path(&relative) {
-                continue;
-            }
-            let absolute = repo_root.join(&relative);
-            let metadata = match fs::symlink_metadata(&absolute) {
-                Ok(metadata) => metadata,
-                Err(_) => continue,
-            };
-            if metadata.file_type().is_symlink() {
-                continue;
-            }
-
-            normalized.insert(relative.clone());
-            if metadata.is_dir() {
-                expand_directory(repo_root, &absolute, &mut normalized);
-            }
-        }
-
-        let mut nodes = BTreeMap::<String, ExtraNode>::new();
-        let mut roots = BTreeSet::<String>::new();
-
-        for path in normalized {
-            let is_dir = repo_root.join(&path).is_dir();
-            if insert_path(&mut nodes, &mut roots, &path, is_dir).is_err() {
-                continue;
-            }
-        }
-
+    pub(crate) fn from_index(index: ExtrasIndex) -> Self {
+        let collapsed = index
+            .nodes
+            .iter()
+            .filter(|(_, node)| node.is_dir)
+            .map(|(key, _)| key.clone())
+            .collect();
         let mut state = Self {
-            nodes,
-            roots: roots.into_iter().collect(),
+            nodes: index.nodes,
+            roots: index.roots,
             checked: HashSet::new(),
-            collapsed: HashSet::new(),
+            collapsed,
             visible: Vec::new(),
             cursor: 0,
             filter: Input::default(),
             editing_filter: false,
         };
         state.refresh_visible();
-        Ok(state)
+        state
     }
 
     pub(crate) fn refresh_visible(&mut self) {
         self.visible.clear();
         let roots = self.roots.clone();
+        let needle = filter_needle(&self.filter);
         for root in &roots {
-            self.push_visible(root);
+            self.push_visible(root, needle.as_deref());
         }
 
         if self.visible.is_empty() {
@@ -98,8 +81,8 @@ impl ExtrasState {
         }
     }
 
-    fn push_visible(&mut self, key: &str) {
-        if !self.subtree_matches_filter(key) {
+    fn push_visible(&mut self, key: &str, needle: Option<&str>) {
+        if !self.subtree_matches_filter(key, needle) {
             return;
         }
 
@@ -111,34 +94,32 @@ impl ExtrasState {
             return;
         };
         let children = node.children.clone();
-        let filtering = !self.filter.value().trim().is_empty();
+        let filtering = needle.is_some();
         let open = filtering || !self.collapsed.contains(key);
 
         if open {
             for child in &children {
-                self.push_visible(child);
+                self.push_visible(child, needle);
             }
         }
     }
 
-    fn subtree_matches_filter(&self, key: &str) -> bool {
-        if self.filter.value().trim().is_empty() {
+    fn subtree_matches_filter(&self, key: &str, needle: Option<&str>) -> bool {
+        let Some(needle) = needle else {
             return true;
-        }
+        };
 
         let Some(node) = self.nodes.get(key) else {
             return false;
         };
 
-        let needle = self.filter.value().trim().to_lowercase();
-        if node.key.to_lowercase().contains(&needle) || node.label.to_lowercase().contains(&needle)
-        {
+        if node.search_key.contains(needle) {
             return true;
         }
 
         node.children
             .iter()
-            .any(|child| self.subtree_matches_filter(child))
+            .any(|child| self.subtree_matches_filter(child, Some(needle)))
     }
 
     pub(crate) fn move_up(&mut self) {
@@ -149,6 +130,21 @@ impl ExtrasState {
         if self.cursor + 1 < self.visible.len() {
             self.cursor += 1;
         }
+    }
+
+    pub(crate) fn move_up_by(&mut self, rows: usize) {
+        self.cursor = self.cursor.saturating_sub(rows);
+    }
+
+    pub(crate) fn move_down_by(&mut self, rows: usize) {
+        if self.visible.is_empty() {
+            self.cursor = 0;
+            return;
+        }
+        self.cursor = self
+            .cursor
+            .saturating_add(rows)
+            .min(self.visible.len().saturating_sub(1));
     }
 
     pub(crate) fn toggle_current(&mut self) {
@@ -233,18 +229,6 @@ impl ExtrasState {
         };
 
         if node.is_dir {
-            if self.checked.contains(key) && self.descendants_fully_checked(key) {
-                selected.push(key.to_string());
-                return;
-            }
-
-            if node.children.is_empty() {
-                if self.checked.contains(key) {
-                    selected.push(key.to_string());
-                }
-                return;
-            }
-
             for child in &node.children {
                 self.collect_selected(child, selected);
             }
@@ -317,16 +301,17 @@ impl ExtrasState {
 
     pub(crate) fn tree_items(&self) -> Vec<TreeItem<'static, String>> {
         let mut items = Vec::new();
+        let needle = filter_needle(&self.filter);
         for root in &self.roots {
-            if let Some(item) = self.tree_item_for(root) {
+            if let Some(item) = self.tree_item_for(root, needle.as_deref()) {
                 items.push(item);
             }
         }
         items
     }
 
-    fn tree_item_for(&self, key: &str) -> Option<TreeItem<'static, String>> {
-        if !self.subtree_matches_filter(key) {
+    fn tree_item_for(&self, key: &str, needle: Option<&str>) -> Option<TreeItem<'static, String>> {
+        if !self.subtree_matches_filter(key, needle) {
             return None;
         }
 
@@ -334,13 +319,13 @@ impl ExtrasState {
         let label = format!(
             "{} {} {}",
             self.mark_for(key),
-            if node.is_dir { "[D]" } else { "[F]" },
+            if node.is_dir { "📁" } else { "📄" },
             node.label
         );
 
         let mut children = Vec::new();
         for child in &node.children {
-            if let Some(item) = self.tree_item_for(child) {
+            if let Some(item) = self.tree_item_for(child, needle) {
                 children.push(item);
             }
         }
@@ -357,7 +342,7 @@ impl ExtrasState {
 
     pub(crate) fn tree_state(&self) -> TreeState<String> {
         let mut state = TreeState::default();
-        let filtering = !self.filter.value().trim().is_empty();
+        let filtering = filter_needle(&self.filter).is_some();
         for row in &self.visible {
             let is_dir = self
                 .nodes
@@ -376,6 +361,35 @@ impl ExtrasState {
     }
 }
 
+#[derive(Debug)]
+struct PreparedPath {
+    normalized: String,
+    components: Vec<String>,
+    lowered_components: Vec<String>,
+}
+
+pub(crate) fn build_extras_index_from_paths(candidates: &[PathBuf]) -> Result<ExtrasIndex> {
+    let mut prepared: Vec<PreparedPath> = candidates
+        .par_iter()
+        .filter_map(|candidate| prepare_candidate_path(candidate))
+        .collect();
+
+    prepared.par_sort_unstable_by(|left, right| left.normalized.cmp(&right.normalized));
+    prepared.dedup_by(|left, right| left.normalized == right.normalized);
+
+    let mut nodes = BTreeMap::<String, ExtraNode>::new();
+    let mut roots = BTreeSet::<String>::new();
+
+    for path in &prepared {
+        insert_prepared_path(&mut nodes, &mut roots, path);
+    }
+
+    Ok(ExtrasIndex {
+        nodes,
+        roots: roots.into_iter().collect(),
+    })
+}
+
 pub(crate) fn identifier_path_for_key(key: &str) -> Vec<String> {
     let mut identifiers = Vec::new();
     let mut current = PathBuf::new();
@@ -389,36 +403,84 @@ pub(crate) fn identifier_path_for_key(key: &str) -> Vec<String> {
     identifiers
 }
 
-pub(crate) fn expand_directory(repo_root: &Path, directory: &Path, output: &mut BTreeSet<PathBuf>) {
-    let entries = match fs::read_dir(directory) {
-        Ok(entries) => entries,
-        Err(_) => return,
-    };
+fn prepare_candidate_path(candidate: &Path) -> Option<PreparedPath> {
+    let normalized = seshmux_core::extras::normalize_extra_relative_path(candidate).ok()?;
+    if is_worktrees_relative_path(&normalized) {
+        return None;
+    }
 
-    for entry in entries {
-        let Ok(entry) = entry else {
-            continue;
+    let mut components = Vec::<String>::new();
+    for component in normalized.components() {
+        let Component::Normal(value) = component else {
+            return None;
         };
-        let Ok(file_type) = entry.file_type() else {
-            continue;
-        };
-        if file_type.is_symlink() {
-            continue;
+        components.push(value.to_str()?.to_string());
+    }
+
+    if components.is_empty() {
+        return None;
+    }
+
+    let lowered_components: Vec<String> = components
+        .iter()
+        .map(|value| value.to_lowercase())
+        .collect();
+    let normalized = components.join("/");
+
+    Some(PreparedPath {
+        normalized,
+        components,
+        lowered_components,
+    })
+}
+
+fn insert_prepared_path(
+    nodes: &mut BTreeMap<String, ExtraNode>,
+    roots: &mut BTreeSet<String>,
+    path: &PreparedPath,
+) {
+    let mut key = String::new();
+    let mut lowered_key = String::new();
+    let mut parent: Option<String> = None;
+
+    for (index, component) in path.components.iter().enumerate() {
+        if index > 0 {
+            key.push('/');
+            lowered_key.push('/');
         }
-        let absolute = entry.path();
-        let Ok(relative) = absolute.strip_prefix(repo_root) else {
-            continue;
-        };
-        let relative = relative.to_path_buf();
-        if is_worktrees_relative_path(&relative) {
-            continue;
+        key.push_str(component);
+        lowered_key.push_str(&path.lowered_components[index]);
+
+        let is_last = index + 1 == path.components.len();
+        let node_is_dir = !is_last;
+        let search_key = format!("{} {}", lowered_key, path.lowered_components[index]);
+
+        nodes
+            .entry(key.clone())
+            .and_modify(|node| {
+                if node_is_dir {
+                    node.is_dir = true;
+                }
+            })
+            .or_insert_with(|| ExtraNode {
+                label: component.clone(),
+                search_key,
+                is_dir: node_is_dir,
+                children: Vec::new(),
+            });
+
+        if let Some(parent_key) = &parent {
+            if let Some(parent_node) = nodes.get_mut(parent_key)
+                && !parent_node.children.iter().any(|child| child == &key)
+            {
+                parent_node.children.push(key.clone());
+                parent_node.children.sort();
+            }
+        } else {
+            roots.insert(key.clone());
         }
 
-        output.insert(relative.clone());
-
-        if file_type.is_dir() {
-            expand_directory(repo_root, &absolute, output);
-        }
+        parent = Some(key.clone());
     }
 }
 
@@ -429,96 +491,34 @@ fn is_worktrees_relative_path(path: &Path) -> bool {
     )
 }
 
-pub(crate) fn insert_path(
-    nodes: &mut BTreeMap<String, ExtraNode>,
-    roots: &mut BTreeSet<String>,
-    path: &Path,
-    is_dir: bool,
-) -> Result<()> {
-    let mut current = PathBuf::new();
-    let components: Vec<_> = path.components().collect();
-
-    for (index, component) in components.iter().enumerate() {
-        let Component::Normal(part) = component else {
-            return Err(anyhow!(
-                "invalid extra path component in {}",
-                path.display()
-            ));
-        };
-
-        current.push(part);
-        let key = current
-            .to_str()
-            .ok_or_else(|| anyhow!("extra path is not valid UTF-8: {}", path.display()))?
-            .to_string();
-
-        let parent = current
-            .parent()
-            .and_then(|value| value.to_str())
-            .filter(|value| !value.is_empty())
-            .map(ToString::to_string);
-
-        let is_last = index + 1 == components.len();
-        let node_is_dir = if is_last { is_dir } else { true };
-        let label = part
-            .to_str()
-            .ok_or_else(|| anyhow!("extra path is not valid UTF-8: {}", path.display()))?
-            .to_string();
-
-        nodes
-            .entry(key.clone())
-            .and_modify(|node| {
-                if node_is_dir {
-                    node.is_dir = true;
-                }
-            })
-            .or_insert_with(|| ExtraNode {
-                key: key.clone(),
-                label,
-                is_dir: node_is_dir,
-                children: Vec::new(),
-            });
-
-        if let Some(parent_key) = &parent {
-            if let Some(parent_node) = nodes.get_mut(parent_key) {
-                if !parent_node.children.iter().any(|child| child == &key) {
-                    parent_node.children.push(key.clone());
-                    parent_node.children.sort();
-                }
-            }
-        } else {
-            roots.insert(key);
-        }
+fn filter_needle(input: &Input) -> Option<String> {
+    let needle = input.value().trim();
+    if needle.is_empty() {
+        None
+    } else {
+        Some(needle.to_lowercase())
     }
-
-    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
     use std::path::PathBuf;
+    use std::time::Instant;
 
-    use super::ExtrasState;
-    use super::expand_directory;
+    use super::{ExtrasState, build_extras_index_from_paths};
 
-    #[cfg(unix)]
-    use std::os::unix::fs::symlink;
+    fn open_first_directory(state: &mut ExtrasState) {
+        state.cursor = 0;
+        state.toggle_fold_current();
+    }
 
     #[test]
     fn from_candidates_skips_invalid_relative_paths() {
-        let temp = tempfile::tempdir().expect("temp dir");
-        let repo_root = temp.path();
-        std::fs::write(repo_root.join("keep.txt"), "ok").expect("write file");
-
-        let state = ExtrasState::from_candidates(
-            repo_root,
-            &[
-                PathBuf::from("../outside.txt"),
-                PathBuf::from("keep.txt"),
-                PathBuf::from("./"),
-            ],
-        )
+        let state = ExtrasState::from_candidates(&[
+            PathBuf::from("../outside.txt"),
+            PathBuf::from("keep.txt"),
+            PathBuf::from("./"),
+        ])
         .expect("state");
 
         assert!(state.nodes.contains_key("keep.txt"));
@@ -527,89 +527,205 @@ mod tests {
 
     #[test]
     fn from_candidates_skips_worktrees_directory() {
-        let temp = tempfile::tempdir().expect("temp dir");
-        let repo_root = temp.path().join("repo");
-        std::fs::create_dir_all(repo_root.join("worktrees/cache")).expect("worktrees");
-        std::fs::write(repo_root.join("keep.txt"), "ok").expect("keep");
-        std::fs::write(repo_root.join("worktrees/cache/state.txt"), "state").expect("state");
-
-        let state = ExtrasState::from_candidates(
-            &repo_root,
-            &[PathBuf::from("worktrees"), PathBuf::from("keep.txt")],
-        )
+        let state = ExtrasState::from_candidates(&[
+            PathBuf::from("worktrees/cache/state.txt"),
+            PathBuf::from("keep.txt"),
+        ])
         .expect("state");
 
         assert!(state.nodes.contains_key("keep.txt"));
         assert!(!state.nodes.contains_key("worktrees"));
     }
 
-    #[cfg(unix)]
     #[test]
-    fn from_candidates_skips_symlink_candidates() {
-        let temp = tempfile::tempdir().expect("temp dir");
-        let repo_root = temp.path().join("repo");
-        let outside_root = temp.path().join("outside");
-
-        std::fs::create_dir_all(&repo_root).expect("repo");
-        std::fs::create_dir_all(&outside_root).expect("outside");
-        std::fs::write(outside_root.join("secret.txt"), "TOPSECRET").expect("secret");
-        symlink(outside_root.join("secret.txt"), repo_root.join("link.txt")).expect("symlink");
-        std::fs::write(repo_root.join("keep.txt"), "keep").expect("keep");
-
-        let state = ExtrasState::from_candidates(
-            &repo_root,
-            &[PathBuf::from("link.txt"), PathBuf::from("keep.txt")],
-        )
+    fn build_index_contains_top_level_nodes() {
+        let state = ExtrasState::from_candidates(&[
+            PathBuf::from("src/main.rs"),
+            PathBuf::from("src/lib.rs"),
+            PathBuf::from("notes.txt"),
+        ])
         .expect("state");
 
-        assert!(state.nodes.contains_key("keep.txt"));
-        assert!(!state.nodes.contains_key("link.txt"));
+        assert_eq!(state.roots, vec!["notes.txt", "src"]);
     }
 
-    #[cfg(unix)]
     #[test]
-    fn expand_directory_skips_symlink_children() {
-        let temp = tempfile::tempdir().expect("temp dir");
-        let repo_root = temp.path().join("repo");
-        let outside_root = temp.path().join("outside");
+    fn toggling_fold_uses_prebuilt_index_without_discovery_io() {
+        let mut state = ExtrasState::from_candidates(&[
+            PathBuf::from("dir/sub/one.txt"),
+            PathBuf::from("dir/sub/two.txt"),
+        ])
+        .expect("state");
 
-        std::fs::create_dir_all(repo_root.join("assets")).expect("assets");
-        std::fs::create_dir_all(&outside_root).expect("outside");
-        std::fs::write(repo_root.join("assets/keep.txt"), "keep").expect("keep");
-        std::fs::write(outside_root.join("secret.txt"), "TOPSECRET").expect("secret");
-        symlink(
-            outside_root.join("secret.txt"),
-            repo_root.join("assets/link.txt"),
-        )
-        .expect("symlink");
-
-        let mut output = BTreeSet::new();
-        expand_directory(&repo_root, &repo_root.join("assets"), &mut output);
-
-        assert!(output.contains(&PathBuf::from("assets/keep.txt")));
-        assert!(!output.contains(&PathBuf::from("assets/link.txt")));
+        assert_eq!(state.visible.len(), 1);
+        open_first_directory(&mut state);
+        assert!(state.visible.len() > 1);
+        state.toggle_fold_current();
+        assert_eq!(state.visible.len(), 1);
     }
 
-    #[cfg(unix)]
     #[test]
-    fn from_candidates_skips_unreadable_directories() {
-        use std::os::unix::fs::PermissionsExt;
+    fn filter_unfolds_matching_subtrees() {
+        let mut state = ExtrasState::from_candidates(&[
+            PathBuf::from("dir/sub/one.txt"),
+            PathBuf::from("dir/sub/two.txt"),
+        ])
+        .expect("state");
 
-        let temp = tempfile::tempdir().expect("temp dir");
-        let repo_root = temp.path().join("repo");
-        let blocked = repo_root.join("blocked");
-        std::fs::create_dir_all(&blocked).expect("blocked dir");
-        std::fs::write(blocked.join("hidden.txt"), "x").expect("hidden file");
-        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o000))
-            .expect("chmod blocked");
+        state.filter = tui_input::Input::new("one".to_string());
+        state.refresh_visible();
 
-        let state =
-            ExtrasState::from_candidates(&repo_root, &[PathBuf::from("blocked")]).expect("state");
+        let visible: Vec<String> = state.visible.iter().map(|row| row.key.clone()).collect();
+        assert_eq!(visible, vec!["dir", "dir/sub", "dir/sub/one.txt"]);
+    }
 
-        assert!(state.nodes.contains_key("blocked"));
-        assert!(!state.nodes.contains_key("blocked/hidden.txt"));
+    #[test]
+    fn directory_selection_mark_shows_partial_when_descendants_diverge() {
+        let mut state = ExtrasState::from_candidates(&[
+            PathBuf::from("dir/one.txt"),
+            PathBuf::from("dir/two.txt"),
+        ])
+        .expect("state");
 
-        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o755))
-            .expect("restore blocked");
+        open_first_directory(&mut state);
+        state.toggle_current();
+        state.move_down();
+        state.toggle_current();
+
+        assert_eq!(state.mark_for("dir"), "[-]");
+    }
+
+    #[test]
+    fn deterministic_ordering_is_stable_for_repeated_and_shuffled_inputs() {
+        let base = vec![
+            PathBuf::from("b/z.txt"),
+            PathBuf::from("a/y.txt"),
+            PathBuf::from("a/x.txt"),
+        ];
+        let shuffled = vec![
+            PathBuf::from("a/x.txt"),
+            PathBuf::from("b/z.txt"),
+            PathBuf::from("a/y.txt"),
+        ];
+
+        let first = build_extras_index_from_paths(&base).expect("first");
+        let second = build_extras_index_from_paths(&base).expect("second");
+        let third = build_extras_index_from_paths(&shuffled).expect("third");
+
+        assert_eq!(first.roots, second.roots);
+        assert_eq!(first.roots, third.roots);
+        assert_eq!(first.nodes["a"].children, second.nodes["a"].children);
+        assert_eq!(first.nodes["a"].children, third.nodes["a"].children);
+    }
+
+    #[test]
+    fn selected_for_copy_emits_only_leaves_when_directory_fully_checked() {
+        let mut state = ExtrasState::from_candidates(&[
+            PathBuf::from("crates/.DS_Store"),
+            PathBuf::from("crates/seshmux-tui/src/ui/loading.rs"),
+        ])
+        .expect("state");
+
+        state.toggle_current();
+        let selected = state.selected_for_copy();
+
+        assert_eq!(
+            selected,
+            vec![
+                PathBuf::from("crates/.DS_Store"),
+                PathBuf::from("crates/seshmux-tui/src/ui/loading.rs"),
+            ]
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn timing_receipt_large_synthetic_tree_index_and_interaction() {
+        let mut candidates = Vec::<PathBuf>::new();
+
+        for index in 0..90_000 {
+            candidates.push(PathBuf::from(format!("target/debug/deps/object-{index}.o")));
+        }
+
+        for index in 0..1_500 {
+            candidates.push(PathBuf::from(format!("node_modules/pkg-{index}/index.js")));
+        }
+
+        for index in 0..1_500 {
+            candidates.push(PathBuf::from(format!("dist/chunk-{index}.js")));
+        }
+
+        let build_started = Instant::now();
+        let index = build_extras_index_from_paths(&candidates).expect("index");
+        let build_elapsed = build_started.elapsed();
+
+        let mut state = ExtrasState::from_index(index);
+        let interaction_started = Instant::now();
+        for _ in 0..500 {
+            state.move_down_by(2);
+            state.move_up_by(1);
+            state.toggle_fold_current();
+            state.toggle_fold_current();
+        }
+        state.filter = tui_input::Input::new("object-89999".to_string());
+        state.refresh_visible();
+        let interaction_elapsed = interaction_started.elapsed();
+
+        println!(
+            "TIMING build_extras_index_from_paths entries={} elapsed_ms={}",
+            candidates.len(),
+            build_elapsed.as_millis()
+        );
+        println!(
+            "TIMING extras_picker_interaction visible_rows={} elapsed_ms={}",
+            state.visible.len(),
+            interaction_elapsed.as_millis()
+        );
+        assert!(!state.nodes.is_empty());
+    }
+
+    #[test]
+    #[ignore]
+    fn timing_receipt_large_synthetic_tree_skip_ratio() {
+        let mut candidates = Vec::<PathBuf>::new();
+
+        for index in 0..90_000 {
+            candidates.push(PathBuf::from(format!("target/debug/deps/object-{index}.o")));
+        }
+
+        for index in 0..1_500 {
+            candidates.push(PathBuf::from(format!("node_modules/pkg-{index}/index.js")));
+        }
+
+        for index in 0..1_500 {
+            candidates.push(PathBuf::from(format!("dist/chunk-{index}.js")));
+        }
+
+        let full_started = Instant::now();
+        let _ = build_extras_index_from_paths(&candidates).expect("full index");
+        let full_elapsed = full_started.elapsed();
+
+        let skip_rules = std::collections::BTreeSet::from([
+            "target".to_string(),
+            "node_modules".to_string(),
+            "dist".to_string(),
+        ]);
+        let flagged = seshmux_core::extras::classify_flagged_buckets(&candidates, &skip_rules);
+        let skipped: std::collections::BTreeSet<String> = flagged.keys().cloned().collect();
+        let filtered =
+            seshmux_core::extras::filter_candidates_by_skipped_buckets(&candidates, &skipped);
+
+        let skip_started = Instant::now();
+        let _ = build_extras_index_from_paths(&filtered).expect("filtered index");
+        let skip_elapsed = skip_started.elapsed();
+
+        let ratio = full_elapsed.as_secs_f64() / skip_elapsed.as_secs_f64().max(0.001);
+        println!(
+            "TIMING extras_skip_ratio full_ms={} skip_ms={} ratio={:.2}",
+            full_elapsed.as_millis(),
+            skip_elapsed.as_millis(),
+            ratio
+        );
+        assert!(ratio >= 10.0, "expected ratio >= 10.0, got {ratio:.2}");
     }
 }

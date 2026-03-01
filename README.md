@@ -39,10 +39,14 @@
 
 - Manage Git worktrees from one TUI
 - Create a tmux session per worktree as needed
-- Carry selected untracked/gitignored files into new worktrees
+- Opt in to copying selected untracked/gitignored files during `new`
+- Extras loading is asynchronous with immediate progress feedback
+- Extras copy is leaf-only (directory rows are bulk toggles, not copy sources)
+- Large artifact directory buckets can be skipped per run and persisted per repo (rules match at any depth and show full matched paths; buckets set as always in config stay fixed in the modal)
 - Attach to or create worktree sessions from the TUI
 - Define per-window programs via config
 - Vim-style keybindings
+- Mouse wheel scrolling in the extras picker
 
 ## Requirements
 

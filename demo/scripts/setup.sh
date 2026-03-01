@@ -133,6 +133,11 @@ write_registry() {
   mkdir -p "$repo_dir/worktrees"
 
   cat > "$repo_dir/worktrees/worktree.toml" <<TOML
+version = 1
+
+[settings.extras]
+always_skip_buckets = ["target", "node_modules"]
+
 [[worktree]]
 name = "$worktree_name"
 path = "$worktree_path"

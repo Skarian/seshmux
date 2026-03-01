@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -79,6 +80,33 @@ impl<'a> App<'a> {
         seshmux_core::extras::list_extra_candidates(repo_root, self.runner).with_context(|| {
             format!(
                 "failed to list extra copy candidates in {}",
+                repo_root.display()
+            )
+        })
+    }
+
+    pub fn new_load_always_skip_buckets_for_indexing(
+        &self,
+        repo_root: &Path,
+    ) -> Result<seshmux_core::registry::AlwaysSkipBucketsLoad> {
+        seshmux_core::registry::load_always_skip_buckets_for_indexing(repo_root).with_context(
+            || {
+                format!(
+                    "failed to load extras skip settings in {}",
+                    repo_root.display()
+                )
+            },
+        )
+    }
+
+    pub fn new_save_always_skip_buckets(
+        &self,
+        repo_root: &Path,
+        buckets: &BTreeSet<String>,
+    ) -> Result<()> {
+        seshmux_core::registry::save_always_skip_buckets(repo_root, buckets).with_context(|| {
+            format!(
+                "failed to persist extras skip settings in {}",
                 repo_root.display()
             )
         })
